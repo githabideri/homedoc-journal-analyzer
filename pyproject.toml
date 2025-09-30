@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "homedoc-journal-analyzer"
+version = "0.1.0"
+description = "Analyze journalctl/dmesg logs, cluster issues, and optionally summarize with a local LLM; flat report by default."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "GPL-3.0-or-later" }
+authors = [ { name = "Martin Fellner", email = "martin.fellner@tmw.at" } ]
+keywords = ["journalctl", "dmesg", "logs", "systemd", "llm", "report", "homedoc"]
+classifiers = [
+  "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Environment :: Console",
+  "Intended Audience :: System Administrators",
+  "Topic :: System :: Logging",
+  "Topic :: Utilities",
+]
+
+[project.scripts]
+homedoc-journal-analyzer = "homedoc_journal_analyzer:main"
+
+[tool.setuptools]
+py-modules = ["homedoc_journal_analyzer"]

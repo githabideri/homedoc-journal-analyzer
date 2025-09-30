@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+.cache/
+.venv/
+.venv*/
+venv/
+.env
+
+# Editor/OS
+.DS_Store
+Thumbs.db
+
+# Tooling outputs
+.hypothesis/
+.pytest_cache/
+.mypy_cache/
+
+# Project artifacts
+homedoc_journal_analyzer_*/
+*.log
