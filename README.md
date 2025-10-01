@@ -10,7 +10,7 @@ If you want to commit, feel free to fork, mess around and put "ai slop" on my "a
 
 # HomeDoc — Journal Analyzer
 
-![version](https://img.shields.io/badge/version-0.1.0-blue.svg)
+![version](https://img.shields.io/badge/version-0.1.1-blue.svg)
 ![license](https://img.shields.io/badge/license-GPLv3-blue.svg)
 
 Single-file, stdlib-only utility that:
@@ -21,7 +21,12 @@ Single-file, stdlib-only utility that:
 
 > Designed to mirror the style/flags of the first homedoc script (tailscale status).
 
-## Install
+## Run or Install
+
+```bash
+# Run directly without installing (quick streaming triage)
+python3 homedoc_journal_analyzer.py --quick
+```
 
 ```bash
 pipx install .
@@ -38,6 +43,10 @@ homedoc-journal-analyzer \\
   --model qwen3:14b \\
   --outfile ~/Obsidian/IT/homedoc/journal_analyzer/{ts}_{model}_journal.md
 ```
+
+### Interactive helper
+
+Run without flags (or pass `--interactive`) to open a guided prompt that starts from the one-hour quick scan and lets you pick the model (gemma3:12b default, `q` for gemma3:4b, `t` for qwen3:14b, or custom), server, and whether the answer streams to the terminal or is saved to files.
 
 ### Folder mode (automatically when --outdir or extra artifacts)
 
@@ -57,8 +66,23 @@ homedoc-journal-analyzer --all --tag-model --outdir ~/Obsidian/IT/homedoc/runs
   - `--md` (default), `--json`, `--log`, `--all`
 - **LLM**
   - `--server` (alias of `--model-url`), `--model` (default: qwen3:14b), `--no-llm`
+  - `--quick` (1h journal errors, gemma3:4b, streamed output), `--interactive`
 - **Guards**
   - `--max-entries`, `--limit`, `--yes`, `--no`
+
+## Update
+
+If you installed with `pipx`, refresh the package:
+
+```bash
+pipx upgrade homedoc-journal-analyzer
+```
+
+For a `pip` installation:
+
+```bash
+pip install --upgrade homedoc-journal-analyzer
+```
 
 ## Debugging
 
