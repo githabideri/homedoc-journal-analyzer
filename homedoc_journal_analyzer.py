@@ -92,7 +92,6 @@ RE_MAC = re.compile(r"\b[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}\b")
 RE_HEX = re.compile(r"0x[0-9A-Fa-f]+|\b[0-9A-Fa-f]{8,}\b")
 RE_NUM = re.compile(r"\b\d+\b")
 RE_TS_BRACKET = re.compile(r"^\[[^\]]+\]\s+")  # dmesg prefix
-RE_THINK = re.compile(r"<(think|thinking)>(.*?)</(think|thinking)>", re.DOTALL | re.IGNORECASE)
 RE_PATH = re.compile(r"/[^\s]+")
 
 # -------------------------------
@@ -735,8 +734,11 @@ def llm_summarize(
     chars = 0
 
     thinking_buf: List[str] = []
+    current_thinking: List[str] = []
     final_buf: List[str] = []
     streamed_any = False
+    partial_tag: str = ""
+    in_thinking = False
     try:
         with urllib.request.urlopen(req, timeout=180) as r:
             for raw in r:
@@ -749,14 +751,58 @@ def llm_summarize(
                     continue
                 chunks += 1
                 chars += len(piece)
-                m = RE_THINK.search(piece)
-                if m:
-                    thinking_buf.append(m.group(2))
-                    piece = RE_THINK.sub("", piece)
-                final_buf.append(piece)
-                if stream_stdout and piece:
-                    print(piece, end="", flush=True)
-                    streamed_any = True
+                if partial_tag:
+                    piece = partial_tag + piece
+                    partial_tag = ""
+
+                idx = 0
+                piece_len = len(piece)
+                lower_piece = piece.lower()
+                while idx < piece_len:
+                    if in_thinking:
+                        close_idx = lower_piece.find("</think", idx)
+                        if close_idx == -1:
+                            current_thinking.append(piece[idx:])
+                            idx = piece_len
+                            break
+                        current_thinking.append(piece[idx:close_idx])
+                        gt_idx = piece.find(">", close_idx)
+                        if gt_idx == -1:
+                            partial_tag = piece[close_idx:]
+                            idx = piece_len
+                            break
+                        thinking_buf.append("".join(current_thinking).strip())
+                        current_thinking.clear()
+                        idx = gt_idx + 1
+                        in_thinking = False
+                        lower_piece = piece.lower()  # refresh in case of modifications
+                        continue
+                    open_idx = lower_piece.find("<think", idx)
+                    if open_idx == -1:
+                        segment = piece[idx:]
+                        if segment:
+                            final_buf.append(segment)
+                            if stream_stdout:
+                                print(segment, end="", flush=True)
+                                streamed_any = True
+                        idx = piece_len
+                    else:
+                        before = piece[idx:open_idx]
+                        if before:
+                            final_buf.append(before)
+                            if stream_stdout:
+                                print(before, end="", flush=True)
+                                streamed_any = True
+                        gt_idx = piece.find(">", open_idx)
+                        if gt_idx == -1:
+                            partial_tag = piece[open_idx:]
+                            in_thinking = True
+                            idx = piece_len
+                        else:
+                            idx = gt_idx + 1
+                            in_thinking = True
+                            current_thinking.clear()
+                        lower_piece = piece.lower()
                 now = time.time()
                 if now >= next_tick:
                     elapsed = now - t0
@@ -776,7 +822,9 @@ def llm_summarize(
     final_text = "".join(final_buf).strip()
     if stream_stdout and streamed_any and (not final_text.endswith("\n")):
         print()
-    thinking_text = "\n\n".join(thinking_buf).strip() if thinking_buf else None
+    if in_thinking and current_thinking:
+        thinking_buf.append("".join(current_thinking).strip())
+    thinking_text = "\n\n".join([t for t in thinking_buf if t]).strip() if thinking_buf else None
     return (final_text or "(no summary)", thinking_text)
 
 # -------------------------------
