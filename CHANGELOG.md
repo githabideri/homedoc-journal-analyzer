@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.1 — 2025-10-03
+## 0.1.1 — 2025-10-01
 - Normalize `--server` to assume `http://<host>:11434/api/generate` while still accepting full URLs.
 - Add `--quick` streaming mode and an interactive wizard (default when no flags).
 - Stream LLM output directly to the terminal for quick/interactive runs.
