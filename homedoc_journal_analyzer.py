@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
- homedoc_journal_analyzer v0.1.0
+ homedoc_journal_analyzer v0.1.1
 
  Single-file, stdlib-only journalctl/dmesg analyzer with optional local LLM summary.
 
@@ -11,6 +11,10 @@
   - Output: **flat single-file** Markdown in CWD (e.g., homedoc_journal_analyzer_<ts>_report.md)
   - Model: qwen3:14b @ http://localhost:11434 (Ollama-compatible)
   - Max preflight entries: 10000 (interactive guard)
+
+ Helpers:
+  - Run with no flags (or --interactive) for a guided setup starting from the 1h quick scan (gemma3:12b by default).
+  - Use --quick for a non-interactive 1h journal error sweep (gemma3:4b) that streams the answer to the terminal.
 
  Folder mode is auto-enabled when you request extra artifacts (--json/--log/--debug/--all) or pass --outdir or --no-flat.
  In folder mode, files include the timestamp by default (e.g., report_<ts>.md). You can disable that with --no-stamp-names.
@@ -50,6 +54,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
@@ -58,7 +63,7 @@ from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 # Utilities & config
 # -------------------------------
 APP_NAME = "homedoc_journal_analyzer"
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 # Align with homedoc flags/env: prefer HOMEDOC_SERVER; keep HOMEDOC_MODEL_URL for compatibility
 DEFAULT_MODEL_URL = (
     os.environ.get("HOMEDOC_SERVER")
@@ -68,6 +73,8 @@ DEFAULT_MODEL_URL = (
 DEFAULT_MODEL_NAME = os.environ.get("HOMEDOC_MODEL", "qwen3:14b")
 DEFAULT_LAST = os.environ.get("HOMEDOC_LAST", "24h")
 DEFAULT_MAX_ENTRIES = int(os.environ.get("HOMEDOC_MAX_ENTRIES", "10000"))
+
+VERBOSE = True
 
 LEVEL_NAMES = {
     0: "emerg",
@@ -85,7 +92,6 @@ RE_MAC = re.compile(r"\b[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}\b")
 RE_HEX = re.compile(r"0x[0-9A-Fa-f]+|\b[0-9A-Fa-f]{8,}\b")
 RE_NUM = re.compile(r"\b\d+\b")
 RE_TS_BRACKET = re.compile(r"^\[[^\]]+\]\s+")  # dmesg prefix
-RE_THINK = re.compile(r"<(think|thinking)>(.*?)</(think|thinking)>", re.DOTALL | re.IGNORECASE)
 RE_PATH = re.compile(r"/[^\s]+")
 
 # -------------------------------
@@ -153,11 +159,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--model", default=DEFAULT_MODEL_NAME, help="LLM model name (default: qwen3:14b)")
     p.add_argument("--no-llm", action="store_true", help="Disable LLM summary entirely")
 
+    p.add_argument("--quick", action="store_true",
+                   help="Shortcut: last 1h journal errors, gemma3:4b, stream answer to terminal")
+    p.add_argument("--interactive", action="store_true",
+                   help="Launch interactive helper (default when no flags)")
+    p.add_argument("--show-thinking", action="store_true",
+                   help="Include the model's <thinking> block in terminal/file outputs")
+
     # Redaction
     p.add_argument("--redact", default=None,
                    help="Comma-separated: ips,macs,nums,hex (applies to outputs, not internal clustering)")
 
     args = p.parse_args(argv)
+
+    setattr(args, "stream_only", False)
 
     # Output defaults
     if not (args.md or args.json or args.log or args.debug or args.all):
@@ -170,6 +185,203 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
     return args
 
+
+def normalize_model_url(raw: Optional[str]) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return DEFAULT_MODEL_URL
+
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", s):
+        candidate = f"http://{s}"
+    else:
+        candidate = s
+
+    parsed = urllib.parse.urlparse(candidate)
+    netloc = parsed.netloc or parsed.path
+    path = parsed.path if parsed.netloc else ""
+
+    if not netloc:
+        return DEFAULT_MODEL_URL
+
+    if parsed.port is None:
+        if netloc.startswith("[") and netloc.endswith("]"):
+            netloc = f"{netloc}:11434"
+        elif ":" not in netloc:
+            netloc = f"{netloc}:11434"
+
+    if not path or path == "/":
+        path = "/api/generate"
+    elif not path.endswith("/api/generate"):
+        path = path.rstrip("/") or "/api/generate"
+
+    return urllib.parse.urlunparse(
+        (
+            parsed.scheme or "http",
+            netloc,
+            path,
+            parsed.params,
+            parsed.query,
+            parsed.fragment,
+        )
+    )
+
+
+def apply_quick_defaults(args: argparse.Namespace, provided_options: Optional[set[str]] = None) -> None:
+    provided_options = provided_options or set()
+    args.source = "journal"
+    args.mode = "error"
+    if "--last" not in provided_options and "--since" not in provided_options and "--until" not in provided_options:
+        args.last = "1h"
+        args.since = None
+        args.until = None
+    if "--model" not in provided_options:
+        args.model = "gemma3:4b"
+    if "--no-llm" not in provided_options:
+        args.no_llm = False
+    args.stream_only = True
+    args.md = False
+    args.json = False
+    args.log = False
+    args.debug = False
+    args.all = False
+    args.outdir = None
+    args.outfile = None
+    args.flat = False
+    args.no_flat = False
+    args.tag_model = False
+    if "--show-thinking" not in provided_options:
+        args.show_thinking = False
+
+
+def run_interactive_wizard(args: argparse.Namespace, provided_options: Optional[set[str]] = None) -> None:
+    provided_options = provided_options or set()
+    print(f"{APP_NAME} v{VERSION} — interactive helper")
+    print("Repository: https://github.com/tmw-homedoc/homedoc-journal-analyzer")
+    print("This assistant prepares a fast journalctl triage (defaults: last 1h of error-level entries).")
+    print("")
+
+    default_model_choice = "gemma3:12b"
+    quick_model_choice = "gemma3:4b"
+    thinking_model_choice = "qwen3:14b"
+    existing_model = args.model if "--model" in provided_options else default_model_choice
+    prompt = (
+        f"Model? [Enter={existing_model} | q={quick_model_choice} | t={thinking_model_choice} | custom name] "
+    )
+    choice = ""
+    try:
+        choice = input(prompt).strip()
+    except EOFError:
+        choice = ""
+
+    if not choice:
+        args.model = existing_model
+    elif choice.lower() == "q":
+        args.model = quick_model_choice
+    elif choice.lower() == "t":
+        args.model = thinking_model_choice
+    elif choice.lower() == "c":
+        custom = input("Enter model tag: ").strip()
+        if custom:
+            args.model = custom
+    else:
+        args.model = choice
+
+    default_server = args.model_url or DEFAULT_MODEL_URL
+    server_prompt = (
+        "LLM server? Enter host/url (defaults to {}): ".format(default_server)
+    )
+    try:
+        server_choice = input(server_prompt).strip()
+    except EOFError:
+        server_choice = ""
+    if server_choice:
+        args.model_url = server_choice
+    else:
+        args.model_url = default_server
+
+    output_prompt = "Output target? [Enter=terminal | t=terminal + thinking | f=file report] "
+    try:
+        output_choice = input(output_prompt).strip().lower()
+    except EOFError:
+        output_choice = ""
+
+    if output_choice == "t":
+        args.stream_only = True
+        args.md = False
+        args.show_thinking = True
+    elif output_choice == "f":
+        args.stream_only = False
+        args.md = True
+        if "--show-thinking" not in provided_options:
+            args.show_thinking = False
+    else:
+        args.stream_only = True
+        args.md = False
+        if "--show-thinking" not in provided_options:
+            args.show_thinking = False
+
+    try:
+        adv = input("More options (advanced)? [y/N] ").strip().lower()
+    except EOFError:
+        adv = ""
+
+    if adv in ("y", "yes"):
+        try:
+            last_choice = input("Look-back window (--last), e.g. 30m or 2h (default 1h): ").strip()
+        except EOFError:
+            last_choice = ""
+        if last_choice:
+            args.last = last_choice
+            args.since = None
+            args.until = None
+
+        try:
+            mode_choice = input("Severity preset [error/warn/all/security/boot/kernel] (default error): ").strip()
+        except EOFError:
+            mode_choice = ""
+        if mode_choice:
+            args.mode = mode_choice
+
+        try:
+            source_choice = input("Log source [journal/dmesg/both] (default journal): ").strip()
+        except EOFError:
+            source_choice = ""
+        if source_choice:
+            args.source = source_choice
+
+        try:
+            grep_choice = input("Optional regex filter (blank to skip): ").strip()
+        except EOFError:
+            grep_choice = ""
+        if grep_choice:
+            args.grep = grep_choice
+
+        if not args.stream_only:
+            try:
+                extras = input("Extra artifacts? [j]son, [l]og, [d]ebug (combine, blank=none): ").strip().lower()
+            except EOFError:
+                extras = ""
+            if "a" in extras:
+                args.all = True
+                args.json = True
+                args.log = True
+                args.debug = True
+            else:
+                args.json = "j" in extras
+                args.log = "l" in extras
+                args.debug = "d" in extras
+                args.all = bool(args.json and args.log and args.debug)
+        try:
+            think_prompt = f"Include model <thinking> block? [y/N] (currently {'on' if args.show_thinking else 'off'}): "
+            think_choice = input(think_prompt).strip().lower()
+        except EOFError:
+            think_choice = ""
+        if think_choice in ("y", "yes"):
+            args.show_thinking = True
+        elif think_choice in ("n", "no"):
+            args.show_thinking = False
+    print("")
+
 # -------------------------------
 # Logging helpers
 # -------------------------------
@@ -179,7 +391,8 @@ def ts() -> str:
 
 
 def info(msg: str):
-    print(f"[{ts()}] {msg}")
+    if VERBOSE:
+        print(f"[{ts()}] {msg}")
 
 
 class DebugLog:
@@ -485,7 +698,12 @@ def sanitize_model_tag(model: str) -> str:
     return tag
 
 
-def llm_summarize(clusters: List[Cluster], args: argparse.Namespace, dbg: DebugLog) -> Tuple[str, Optional[str]]:
+def llm_summarize(
+    clusters: List[Cluster],
+    args: argparse.Namespace,
+    dbg: DebugLog,
+    stream_stdout: bool = False,
+) -> Tuple[str, Optional[str]]:
     if args.no_llm:
         return "(LLM disabled)", None
     top = clusters[: min(50, len(clusters))]
@@ -516,7 +734,11 @@ def llm_summarize(clusters: List[Cluster], args: argparse.Namespace, dbg: DebugL
     chars = 0
 
     thinking_buf: List[str] = []
+    current_thinking: List[str] = []
     final_buf: List[str] = []
+    streamed_any = False
+    partial_tag: str = ""
+    in_thinking = False
     try:
         with urllib.request.urlopen(req, timeout=180) as r:
             for raw in r:
@@ -529,11 +751,58 @@ def llm_summarize(clusters: List[Cluster], args: argparse.Namespace, dbg: DebugL
                     continue
                 chunks += 1
                 chars += len(piece)
-                m = RE_THINK.search(piece)
-                if m:
-                    thinking_buf.append(m.group(2))
-                    piece = RE_THINK.sub("", piece)
-                final_buf.append(piece)
+                if partial_tag:
+                    piece = partial_tag + piece
+                    partial_tag = ""
+
+                idx = 0
+                piece_len = len(piece)
+                lower_piece = piece.lower()
+                while idx < piece_len:
+                    if in_thinking:
+                        close_idx = lower_piece.find("</think", idx)
+                        if close_idx == -1:
+                            current_thinking.append(piece[idx:])
+                            idx = piece_len
+                            break
+                        current_thinking.append(piece[idx:close_idx])
+                        gt_idx = piece.find(">", close_idx)
+                        if gt_idx == -1:
+                            partial_tag = piece[close_idx:]
+                            idx = piece_len
+                            break
+                        thinking_buf.append("".join(current_thinking).strip())
+                        current_thinking.clear()
+                        idx = gt_idx + 1
+                        in_thinking = False
+                        lower_piece = piece.lower()  # refresh in case of modifications
+                        continue
+                    open_idx = lower_piece.find("<think", idx)
+                    if open_idx == -1:
+                        segment = piece[idx:]
+                        if segment:
+                            final_buf.append(segment)
+                            if stream_stdout:
+                                print(segment, end="", flush=True)
+                                streamed_any = True
+                        idx = piece_len
+                    else:
+                        before = piece[idx:open_idx]
+                        if before:
+                            final_buf.append(before)
+                            if stream_stdout:
+                                print(before, end="", flush=True)
+                                streamed_any = True
+                        gt_idx = piece.find(">", open_idx)
+                        if gt_idx == -1:
+                            partial_tag = piece[open_idx:]
+                            in_thinking = True
+                            idx = piece_len
+                        else:
+                            idx = gt_idx + 1
+                            in_thinking = True
+                            current_thinking.clear()
+                        lower_piece = piece.lower()
                 now = time.time()
                 if now >= next_tick:
                     elapsed = now - t0
@@ -551,7 +820,11 @@ def llm_summarize(clusters: List[Cluster], args: argparse.Namespace, dbg: DebugL
     dbg.log(f"LLM done: t={elapsed:.1f}s chunks={chunks} chars={chars} ~tokens={approx_tokens} rate={rate:.1f} tok/s")
 
     final_text = "".join(final_buf).strip()
-    thinking_text = "\n\n".join(thinking_buf).strip() if thinking_buf else None
+    if stream_stdout and streamed_any and (not final_text.endswith("\n")):
+        print()
+    if in_thinking and current_thinking:
+        thinking_buf.append("".join(current_thinking).strip())
+    thinking_text = "\n\n".join([t for t in thinking_buf if t]).strip() if thinking_buf else None
     return (final_text or "(no summary)", thinking_text)
 
 # -------------------------------
@@ -611,11 +884,40 @@ def subst_placeholders(path: Path, run_id: str, model_tag: Optional[str]) -> Pat
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = parse_args(argv)
+    raw_argv: List[str]
+    if argv is None:
+        raw_argv = sys.argv[1:]
+    else:
+        raw_argv = list(argv)
+
+    args = parse_args(raw_argv)
+
+    provided_options = {arg.split("=", 1)[0] for arg in raw_argv if arg.startswith("--")}
+    invoked_without_flags = len(raw_argv) == 0
+
+    if args.quick:
+        apply_quick_defaults(args, provided_options)
+
+    run_interactive = args.interactive or (invoked_without_flags and not args.quick)
+    if run_interactive:
+        if sys.stdin.isatty():
+            if not args.quick:
+                apply_quick_defaults(args, provided_options)
+            run_interactive_wizard(args, provided_options)
+        else:
+            if not args.quick:
+                apply_quick_defaults(args, provided_options)
+
+    args.model_url = normalize_model_url(args.model_url)
+
+    global VERBOSE
+    VERBOSE = not getattr(args, "stream_only", False)
 
     # Decide flat vs folder
     extra_artifacts = bool(args.json or args.log or args.debug or args.all)
     folder_mode = bool(args.outdir) or extra_artifacts or bool(args.no_flat)
+    if args.stream_only:
+        folder_mode = False
 
     # Run id and model tag
     run_dt = dt.datetime.now().astimezone()
@@ -640,16 +942,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             "raw.journal" if args.source=="journal" else ("raw.dmesg" if args.source=="dmesg" else "raw.mixed"),
             "jsonl" if args.source=="journal" else "log"
         ) if args.log else None
-        thinking_path = fname("thinking", "txt")
+        thinking_path = fname("thinking", "txt") if args.show_thinking else None
     else:
         outdir = None
-        if args.outfile:
-            md_path = subst_placeholders(Path(args.outfile), run_id, model_tag)
-            md_path.parent.mkdir(parents=True, exist_ok=True)
+        if args.stream_only:
+            md_path = None
+            debug_path = None
+            events_path = insights_path = raw_path = thinking_path = None
         else:
-            md_path = Path.cwd() / f"{APP_NAME}_{run_id}{model_suffix}_report.md"
-        debug_path = (md_path.with_name(md_path.stem + "_debug.log")) if args.debug else None
-        events_path = insights_path = raw_path = thinking_path = None
+            if args.outfile:
+                md_path = subst_placeholders(Path(args.outfile), run_id, model_tag)
+                md_path.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                md_path = Path.cwd() / f"{APP_NAME}_{run_id}{model_suffix}_report.md"
+            debug_path = (md_path.with_name(md_path.stem + "_debug.log")) if args.debug else None
+            events_path = insights_path = raw_path = thinking_path = None
 
     # Debug logger
     dbg = DebugLog(enabled=bool(args.debug))
@@ -755,36 +1062,43 @@ def main(argv: Optional[List[str]] = None) -> int:
     llm_md = None
     thinking_text = None
     if not args.no_llm:
-        llm_md, thinking_text = llm_summarize(clusters, args, dbg)
-        if folder_mode and thinking_text:
+        llm_md, thinking_text = llm_summarize(clusters, args, dbg, stream_stdout=getattr(args, "stream_only", False))
+        if folder_mode and args.show_thinking and thinking_text and thinking_path is not None:
             thinking_path.write_text(thinking_text, encoding="utf-8")
+        if args.stream_only and args.show_thinking and thinking_text:
+            print("\n\n---\nModel thinking (verbatim):\n")
+            print(thinking_text.strip())
+            print("\n---")
 
     # Report
-    meta = {
-        "timestamp": run_dt.strftime("%Y-%m-%d %H:%M:%S %Z"),
-        "source": args.source,
-        "mode": args.mode,
-        "grep": args.grep or "-",
-        "since": args.since or (f"-{args.last}" if args.last else "-"),
-        "until": args.until or "now",
-        "processed entries": str(processed_total),
-        "limit": str(cap) if cap else "-",
-        "model": "disabled" if args.no_llm else args.model,
-        "server": args.model_url,
-    }
-    transparency = None if folder_mode else thinking_text
-    md = make_report_md(meta, clusters, llm_md, transparency)
-    md_path.write_text(md, encoding="utf-8")
+    if not args.stream_only:
+        meta = {
+            "timestamp": run_dt.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "source": args.source,
+            "mode": args.mode,
+            "grep": args.grep or "-",
+            "since": args.since or (f"-{args.last}" if args.last else "-"),
+            "until": args.until or "now",
+            "processed entries": str(processed_total),
+            "limit": str(cap) if cap else "-",
+            "model": "disabled" if args.no_llm else args.model,
+            "server": args.model_url,
+        }
+        transparency = thinking_text if (args.show_thinking and not folder_mode) else None
+        md = make_report_md(meta, clusters, llm_md, transparency)
+        if md_path is not None:
+            md_path.write_text(md, encoding="utf-8")
 
     # Debug log
     if debug_path is not None:
         dbg.flush_to(debug_path)
 
     # Final status
-    if folder_mode:
-        info(f"Wrote outputs to: {outdir}")
-    else:
-        info(f"Wrote outputs to: {md_path}")
+    if not args.stream_only:
+        if folder_mode:
+            info(f"Wrote outputs to: {outdir}")
+        else:
+            info(f"Wrote outputs to: {md_path}")
 
     return 0
 
