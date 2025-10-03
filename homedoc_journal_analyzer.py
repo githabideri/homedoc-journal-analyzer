@@ -62,7 +62,10 @@ from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 # -------------------------------
 # Utilities & config
 # -------------------------------
-APP_NAME = "homedoc_journal_analyzer"
+_RAW_PROG = Path(sys.argv[0]).stem if sys.argv else "homedoc-journal-analyzer"
+APP_NAME = _RAW_PROG.replace("_", "-")
+if APP_NAME not in {"homedoc-journal-analyzer", "lyseur"}:
+    APP_NAME = "homedoc-journal-analyzer"
 VERSION = "0.1.1"
 # Align with homedoc flags/env: prefer HOMEDOC_SERVER; keep HOMEDOC_MODEL_URL for compatibility
 DEFAULT_MODEL_URL = (

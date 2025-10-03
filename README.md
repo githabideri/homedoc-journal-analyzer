@@ -21,11 +21,18 @@ Single-file, stdlib-only utility that:
 
 > Designed to mirror the style/flags of the first homedoc script (tailscale status).
 
+> The CLI installs as `homedoc-journal-analyzer` with a shorter alias `lyseur`.
+
 ## Run or Install
 
 ```bash
 # Run directly without installing (quick streaming triage)
 python3 homedoc_journal_analyzer.py --quick
+
+# Or via the installed CLI entry points (alias: lyseur)
+homedoc-journal-analyzer --quick
+# or
+lyseur --quick
 ```
 
 ```bash
@@ -42,6 +49,12 @@ homedoc-journal-analyzer \\
   --server http://localhost:11434/api/generate \\
   --model qwen3:14b \\
   --outfile ~/Obsidian/IT/homedoc/journal_analyzer/{ts}_{model}_journal.md
+
+# or use the alias
+lyseur \\
+  --server http://localhost:11434/api/generate \\
+  --model qwen3:14b \\
+  --outfile ~/Obsidian/IT/homedoc/journal_analyzer/{ts}_{model}_journal.md
 ```
 
 ### Interactive helper
@@ -51,7 +64,10 @@ Run without flags (or pass `--interactive`) to open a guided prompt that starts 
 ### Folder mode (automatically when --outdir or extra artifacts)
 
 ```bash
+# Folder mode works with either entry point name
 homedoc-journal-analyzer --all --tag-model --outdir ~/Obsidian/IT/homedoc/runs
+# or
+lyseur --all --tag-model --outdir ~/Obsidian/IT/homedoc/runs
 ```
 
 ## Key flags
