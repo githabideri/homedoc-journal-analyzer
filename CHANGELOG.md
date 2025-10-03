@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+- Document `lyseur` as an alias for the `homedoc-journal-analyzer` CLI and publish it as an additional console script.
+
 ## 0.1.1 — 2025-10-01
 - Normalize `--server` to assume `http://<host>:11434/api/generate` while still accepting full URLs.
 - Add `--quick` streaming mode and an interactive wizard (default when no flags).
