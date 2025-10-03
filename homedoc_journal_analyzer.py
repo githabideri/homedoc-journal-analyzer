@@ -400,6 +400,46 @@ def run_interactive_wizard(args: argparse.Namespace, provided_options: Optional[
             args.show_thinking = True
         elif think_choice in ("n", "no"):
             args.show_thinking = False
+    want_handoff = args.handoff == "w"
+    if "--handoff" not in provided_options:
+        try:
+            handoff_choice = input("Continue in OpenWebUI after the run? [y/N] ").strip().lower()
+        except EOFError:
+            handoff_choice = ""
+        if handoff_choice in ("y", "yes"):
+            args.handoff = "w"
+            want_handoff = True
+        elif handoff_choice in ("n", "no"):
+            args.handoff = None
+            want_handoff = False
+    elif want_handoff:
+        print("OpenWebUI handoff already enabled via CLI options.")
+    if want_handoff:
+        if "--openwebui" not in provided_options:
+            try:
+                base_choice = input("OpenWebUI base URL (e.g. https://openwebui): ").strip()
+            except EOFError:
+                base_choice = ""
+            if base_choice:
+                args.openwebui_base = base_choice
+        normalized_base = normalize_openwebui_base(args.openwebui_base or "")
+        if normalized_base:
+            print(f"Bearer token page: {normalized_base}/settings/account")
+        else:
+            print("Bearer token page: <your OpenWebUI base>/settings/account")
+        if "--token" not in provided_options and not args.openwebui_token:
+            token = prompt_openwebui_token("OpenWebUI Bearer token (leave blank to provide later): ")
+            if token:
+                args.openwebui_token = token
+        if "--open-browser" not in provided_options:
+            try:
+                open_choice = input("Open the OpenWebUI chat in your browser afterwards? [y/N] ").strip().lower()
+            except EOFError:
+                open_choice = ""
+            if open_choice in ("y", "yes"):
+                args.open_browser = True
+            elif open_choice in ("n", "no"):
+                args.open_browser = False
     print("")
 
 # -------------------------------
@@ -930,7 +970,15 @@ def normalize_openwebui_base(raw: Optional[str]) -> Optional[str]:
     if not s:
         return None
     if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", s):
-        s = f"http://{s}"
+        host = s
+        default_scheme = "http"
+        if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", host) or host.startswith("localhost"):
+            default_scheme = "http"
+        elif ":" in host:
+            default_scheme = "http"
+        elif "." in host:
+            default_scheme = "https"
+        s = f"{default_scheme}://{host}"
     parsed = urllib.parse.urlparse(s)
     scheme = parsed.scheme or "http"
     netloc = parsed.netloc or parsed.path
@@ -967,6 +1015,9 @@ def parse_semver_tuple(version: str) -> Tuple[int, int, int]:
     return nums[0], nums[1], nums[2]
 
 
+OPENWEBUI_LAST_URL: Optional[str] = None
+
+
 def openwebui_request(
     method: str,
     url: str,
@@ -974,23 +1025,41 @@ def openwebui_request(
     data: Optional[bytes] = None,
     timeout: float = 30.0,
 ):
-    req = urllib.request.Request(url, data=data, method=method)
-    if headers:
+    global OPENWEBUI_LAST_URL
+    headers = dict(headers or {})
+    current_url = url
+    current_method = method
+    body = data
+    for _ in range(6):
+        req = urllib.request.Request(current_url, data=body, method=current_method)
         for k, v in headers.items():
             req.add_header(k, v)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        content = resp.read()
-        ctype = resp.headers.get("Content-Type", "")
-        if "application/json" in ctype:
-            if not content:
-                return {}
-            return json.loads(content.decode("utf-8"))
-        if not content:
-            return {}
         try:
-            return json.loads(content.decode("utf-8"))
-        except Exception:
-            return content
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                OPENWEBUI_LAST_URL = resp.geturl()
+                content = resp.read()
+                ctype = resp.headers.get("Content-Type", "")
+                if "application/json" in ctype:
+                    if not content:
+                        return {}
+                    return json.loads(content.decode("utf-8"))
+                if not content:
+                    return {}
+                try:
+                    return json.loads(content.decode("utf-8"))
+                except Exception:
+                    return content
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308):
+                location = e.headers.get("Location") if e.headers else None
+                if location:
+                    current_url = urllib.parse.urljoin(current_url, location)
+                    if e.code in (301, 302, 303) and current_method not in ("GET", "HEAD"):
+                        current_method = "GET"
+                        body = None
+                    continue
+            raise
+    raise RuntimeError("Too many redirects while contacting OpenWebUI")
 
 
 def openwebui_request_json(
@@ -1006,6 +1075,17 @@ def openwebui_request_json(
         data = json.dumps(json_body).encode("utf-8")
         headers.setdefault("Content-Type", "application/json")
     return openwebui_request(method, url, headers=headers, data=data, timeout=timeout)
+
+
+def effective_openwebui_base(default_base: str) -> str:
+    if not OPENWEBUI_LAST_URL:
+        return default_base
+    parsed = urllib.parse.urlparse(OPENWEBUI_LAST_URL)
+    if not parsed.scheme or not parsed.netloc:
+        return default_base
+    normalized = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
+    normalized = normalized.rstrip("/")
+    return normalized or default_base
 
 
 def extract_first_id(payload: object) -> Optional[str]:
@@ -1201,6 +1281,8 @@ def run_openwebui_handoff(
 ) -> None:
     if args.handoff != "w":
         return
+    global OPENWEBUI_LAST_URL
+    OPENWEBUI_LAST_URL = None
     if getattr(args, "stream_only", False):
         print("OpenWebUI handoff requires saved artifacts; streaming mode is not supported.", file=sys.stderr)
         return
@@ -1229,6 +1311,7 @@ def run_openwebui_handoff(
     headers = {"Authorization": f"Bearer {token}"}
 
     version = fetch_openwebui_version(base, token)
+    base = effective_openwebui_base(base)
     if version:
         version_tuple = parse_semver_tuple(version)
         if version_tuple < (0, 6, 15) and not args.allow_unstable_openwebui:
@@ -1258,6 +1341,7 @@ def run_openwebui_handoff(
     for attempt in range(2):
         try:
             models_payload = openwebui_request("GET", f"{base}/api/models", headers=headers, timeout=15)
+            base = effective_openwebui_base(base)
             break
         except urllib.error.HTTPError as e:
             if e.code == 401 and attempt == 0:
@@ -1266,6 +1350,7 @@ def run_openwebui_handoff(
                 if not token:
                     print("No token provided; aborting OpenWebUI handoff.", file=sys.stderr)
                     return
+                args.openwebui_token = token
                 headers = {"Authorization": f"Bearer {token}"}
                 continue
             print(f"Failed to query OpenWebUI models: HTTP {e.code}", file=sys.stderr)
@@ -1308,6 +1393,7 @@ def run_openwebui_handoff(
         chat_id = create_openwebui_chat(base, token, handoff_model, container_id, llm_seed, run_dt, container_type)
         info("Triggering OpenWebUI completion…")
         trigger_openwebui_completion(base, token, handoff_model, chat_id, container_id, llm_seed)
+        base = effective_openwebui_base(base)
     except urllib.error.HTTPError as e:
         print(f"OpenWebUI API error (HTTP {e.code}): {e.reason}", file=sys.stderr)
         return
@@ -1318,6 +1404,7 @@ def run_openwebui_handoff(
         print(f"OpenWebUI handoff failed: {e}", file=sys.stderr)
         return
 
+    base = effective_openwebui_base(base)
     home_url = f"{base}/"
     chat_url = f"{base}/c/{chat_id}"
     print("OpenWebUI home:", home_url)
