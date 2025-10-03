@@ -1218,13 +1218,34 @@ def upload_openwebui_file(base: str, token: str, path: Path) -> str:
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "Accept": "application/json",
     }
-    url = f"{base}/api/v1/files/upload"
-    resp = openwebui_request("POST", url, headers=headers, data=data, timeout=120)
-    file_id = extract_first_id(resp)
-    if not file_id:
-        raise RuntimeError(f"OpenWebUI upload did not return an id for {path}")
-    return file_id
+    upload_paths = [
+        f"{base}/api/v1/files/upload",
+        f"{base}/api/v1/files",
+        f"{base}/api/v1/files/",
+    ]
+    seen: set[str] = set()
+    last_error: Optional[Exception] = None
+    for url in upload_paths:
+        if url in seen:
+            continue
+        seen.add(url)
+        try:
+            resp = openwebui_request("POST", url, headers=headers, data=data, timeout=120)
+        except urllib.error.HTTPError as e:
+            last_error = e
+            continue
+        except urllib.error.URLError as e:
+            last_error = e
+            continue
+        file_id = extract_first_id(resp)
+        if file_id:
+            return file_id
+        last_error = RuntimeError(f"OpenWebUI upload did not return an id for {path}")
+    if last_error:
+        raise last_error
+    raise RuntimeError(f"Failed to upload {path} to OpenWebUI")
 
 
 def create_openwebui_collection(base: str, token: str, name: str, description: str) -> Tuple[str, str]:
