@@ -273,6 +273,31 @@ def apply_quick_defaults(args: argparse.Namespace, provided_options: Optional[se
         args.show_thinking = False
 
 
+def ensure_openwebui_artifacts(args: argparse.Namespace, announce: bool = False) -> None:
+    if getattr(args, "handoff", None) != "w":
+        return
+    messages: List[str] = []
+    if getattr(args, "stream_only", False):
+        args.stream_only = False
+        messages.append("disabling streaming output")
+    if not getattr(args, "md", False):
+        args.md = True
+    if not getattr(args, "outdir", None) and not getattr(args, "outfile", None):
+        args.outdir = "artifacts"
+        messages.append("saving artifacts under ./artifacts")
+    if getattr(args, "outdir", None):
+        args.flat = False
+        args.no_flat = True
+    if not getattr(args, "no_stamp_names", False):
+        args.stamp_names = True
+    if announce and messages:
+        joined = ", ".join(messages)
+        print(
+            "OpenWebUI handoff needs saved files; "
+            f"{joined}. Markdown and JSON reports will be ready before the chat handoff.",
+        )
+
+
 def run_interactive_wizard(args: argparse.Namespace, provided_options: Optional[set[str]] = None) -> None:
     provided_options = provided_options or set()
     print(f"{APP_NAME} v{VERSION} — interactive helper")
@@ -440,6 +465,7 @@ def run_interactive_wizard(args: argparse.Namespace, provided_options: Optional[
                 args.open_browser = True
             elif open_choice in ("n", "no"):
                 args.open_browser = False
+        ensure_openwebui_artifacts(args, announce=True)
     print("")
 
 # -------------------------------
@@ -1456,6 +1482,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             if not args.quick:
                 apply_quick_defaults(args, provided_options)
+
+    ensure_openwebui_artifacts(args)
 
     args.model_url = normalize_model_url(args.model_url)
 

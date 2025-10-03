@@ -114,6 +114,8 @@ What happens:
 
 Tokens are never persisted: discovery order is CLI `--token`, then `OPENWEBUI_TOKEN`, then a masked prompt (if interactive). Servers older than 0.6.15 are blocked unless you pass `--allow-unstable-openwebui`.
 
+Interactive runs that opt into OpenWebUI will automatically save the Markdown and JSON artifacts under `./artifacts/` (timestamped filenames) before the handoff, so you don't need to re-run with different output settings.
+
 ## Update
 
 If you installed with `pipx`, refresh the package:
