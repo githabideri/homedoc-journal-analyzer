@@ -53,6 +53,7 @@ import random
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -1014,6 +1015,54 @@ def normalize_openwebui_base(raw: Optional[str]) -> Optional[str]:
     return normalized.rstrip("/")
 
 
+def openwebui_base_candidates(raw: Optional[str]) -> List[str]:
+    if raw is None:
+        return []
+    s = (raw or "").strip()
+    if not s:
+        return []
+    candidates: List[str] = []
+    explicit_scheme = bool(re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", s))
+    if explicit_scheme:
+        primary = normalize_openwebui_base(s)
+        if primary:
+            candidates.append(primary)
+        parsed = urllib.parse.urlparse(s)
+        netloc = parsed.netloc or parsed.path
+        if netloc:
+            if parsed.scheme.lower() == "https":
+                alt = normalize_openwebui_base(f"http://{netloc}")
+                if alt:
+                    candidates.append(alt)
+            elif parsed.scheme.lower() == "http":
+                alt = normalize_openwebui_base(f"https://{netloc}")
+                if alt:
+                    candidates.append(alt)
+    else:
+        host = s.rstrip("/")
+        is_ip = bool(re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", host))
+        prefer_https = bool("." in host and not is_ip and not host.startswith("localhost") and ":" not in host)
+        https_candidate = normalize_openwebui_base(f"https://{host}")
+        http_candidate = normalize_openwebui_base(f"http://{host}")
+        if prefer_https:
+            if https_candidate:
+                candidates.append(https_candidate)
+            if http_candidate:
+                candidates.append(http_candidate)
+        else:
+            if http_candidate:
+                candidates.append(http_candidate)
+            if https_candidate:
+                candidates.append(https_candidate)
+    deduped: List[str] = []
+    seen = set()
+    for candidate in candidates:
+        if candidate and candidate not in seen:
+            deduped.append(candidate)
+            seen.add(candidate)
+    return deduped
+
+
 def prompt_openwebui_token(prompt_text: str) -> Optional[str]:
     if not sys.stdin.isatty():
         return None
@@ -1322,8 +1371,8 @@ def run_openwebui_handoff(
         print("OpenWebUI handoff missing run metadata; cannot proceed.", file=sys.stderr)
         return
 
-    base = normalize_openwebui_base(args.openwebui_base or "")
-    if not base:
+    candidates = openwebui_base_candidates(args.openwebui_base)
+    if not candidates:
         print("--openwebui BASE is required for OpenWebUI handoff.", file=sys.stderr)
         return
 
@@ -1336,8 +1385,50 @@ def run_openwebui_handoff(
 
     headers = {"Authorization": f"Bearer {token}"}
 
-    version = fetch_openwebui_version(base, token)
-    base = effective_openwebui_base(base)
+    models_payload = None
+    base: Optional[str] = None
+    last_error: Optional[Exception] = None
+    for candidate in candidates:
+        current_base = candidate
+        for attempt in range(2):
+            try:
+                models_payload = openwebui_request("GET", f"{current_base}/api/models", headers=headers, timeout=20)
+                current_base = effective_openwebui_base(current_base)
+                base = current_base
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and attempt == 0:
+                    print("OpenWebUI token rejected; please re-enter.", file=sys.stderr)
+                    token = prompt_openwebui_token("OpenWebUI Bearer token: ")
+                    if not token:
+                        print("No token provided; aborting OpenWebUI handoff.", file=sys.stderr)
+                        return
+                    args.openwebui_token = token
+                    headers = {"Authorization": f"Bearer {token}"}
+                    continue
+                last_error = e
+                break
+            except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
+                last_error = e
+                break
+        if models_payload is not None:
+            break
+    if models_payload is None or base is None:
+        if isinstance(last_error, urllib.error.HTTPError):
+            print(
+                f"Failed to query OpenWebUI models: HTTP {last_error.code}",
+                file=sys.stderr,
+            )
+        elif last_error is not None:
+            print(f"Failed to reach OpenWebUI models endpoint: {last_error}", file=sys.stderr)
+        else:
+            print("Could not retrieve OpenWebUI models list.", file=sys.stderr)
+        return
+
+    try:
+        version = fetch_openwebui_version(base, token)
+    except (TimeoutError, socket.timeout):
+        version = None
     if version:
         version_tuple = parse_semver_tuple(version)
         if version_tuple < (0, 6, 15) and not args.allow_unstable_openwebui:
@@ -1362,31 +1453,6 @@ def run_openwebui_handoff(
             "Warning: OpenWebUI version check failed; proceeding due to override.",
             file=sys.stderr,
         )
-
-    models_payload = None
-    for attempt in range(2):
-        try:
-            models_payload = openwebui_request("GET", f"{base}/api/models", headers=headers, timeout=15)
-            base = effective_openwebui_base(base)
-            break
-        except urllib.error.HTTPError as e:
-            if e.code == 401 and attempt == 0:
-                print("OpenWebUI token rejected; please re-enter.", file=sys.stderr)
-                token = prompt_openwebui_token("OpenWebUI Bearer token: ")
-                if not token:
-                    print("No token provided; aborting OpenWebUI handoff.", file=sys.stderr)
-                    return
-                args.openwebui_token = token
-                headers = {"Authorization": f"Bearer {token}"}
-                continue
-            print(f"Failed to query OpenWebUI models: HTTP {e.code}", file=sys.stderr)
-            return
-        except urllib.error.URLError as e:
-            print(f"Failed to reach OpenWebUI models endpoint: {e}", file=sys.stderr)
-            return
-    if models_payload is None:
-        print("Could not retrieve OpenWebUI models list.", file=sys.stderr)
-        return
 
     model_candidates = [m for m in extract_model_names(models_payload) if m]
     models = list(dict.fromkeys(model_candidates))
