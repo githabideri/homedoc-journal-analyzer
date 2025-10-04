@@ -1194,16 +1194,36 @@ def handoff_to_openwebui(
         print(f"OpenWebUI chat creation failed: {e}", file=sys.stderr)
         return
 
-    chat_obj = resp.get("chat") if isinstance(resp, dict) else None
-    if not isinstance(chat_obj, dict):
-        chat_obj = resp if isinstance(resp, dict) else None
-    if not isinstance(chat_obj, dict):
-        print("OpenWebUI returned unexpected chat payload.", file=sys.stderr)
-        return
-    chat_id = chat_obj.get("id")
-    if not isinstance(chat_id, str):
+    chat_id: Optional[str] = None
+    chat_obj: Optional[Dict[str, object]] = None
+    if isinstance(resp, dict):
+        chat_obj_raw = resp.get("chat") if isinstance(resp.get("chat"), dict) else None
+        if chat_obj_raw:
+            chat_obj = chat_obj_raw
+            for key in ("id", "_id", "chat_id", "chatId"):
+                val = chat_obj.get(key) if isinstance(chat_obj, dict) else None
+                if isinstance(val, str) and val:
+                    chat_id = val
+                    break
+        if not chat_id:
+            for key in ("chat_id", "chatId", "id", "_id"):
+                val = resp.get(key)
+                if isinstance(val, str) and val:
+                    chat_id = val
+                    break
+        if not chat_obj and isinstance(resp, dict):
+            chat_obj = resp if isinstance(resp.get("messages"), list) else None
+
+    if not chat_id:
         print("OpenWebUI chat id missing from response.", file=sys.stderr)
         return
+
+    if not isinstance(chat_obj, dict):
+        try:
+            chat_obj = client.get_chat(chat_id)
+        except OpenWebUIError as e:
+            print(f"Failed to refresh OpenWebUI chat: {e}", file=sys.stderr)
+            return
 
     try:
         now_ts = int(time.time())
