@@ -23,6 +23,7 @@
  Artifacts (folder mode):
   - report_<ts>[_<model>].md
   - events_<ts>[_<model>].jsonl (when --json or --all)
+  - journal.full_<ts>[_<model>].json (journalctl source; complete JSON export)
   - insights_<ts>[_<model>].json (when --json or --all)
   - raw.journal_<ts>[_<model>].jsonl OR raw.dmesg_<ts>[_<model>].log (when --log or --all)
   - debug_<ts>[_<model>].log (when --debug or --all)
@@ -63,7 +64,7 @@ import urllib.request
 import uuid
 import webbrowser
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 # -------------------------------
 # Utilities & config
@@ -477,6 +478,41 @@ class DebugLog:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(self.buf) + "\n", encoding="utf-8")
 
+
+class JsonArrayWriter:
+    def __init__(self, path: Path):
+        self.path = path
+        self._fh = path.open("w", encoding="utf-8")
+        self._fh.write("[")
+        self._first = True
+        self._closed = False
+
+    def append(self, obj: Dict[str, object]):
+        if self._closed:
+            return
+        if self._first:
+            self._fh.write("\n")
+            self._first = False
+        else:
+            self._fh.write(",\n")
+        self._fh.write(json.dumps(obj, ensure_ascii=False))
+
+    def close(self):
+        if self._closed:
+            return
+        if self._first:
+            self._fh.write("]")
+        else:
+            self._fh.write("\n]")
+        self._fh.close()
+        self._closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
 # -------------------------------
 # Shell exec helpers
 # -------------------------------
@@ -601,7 +637,12 @@ def interactive_gate(total: int, args: argparse.Namespace) -> Tuple[bool, Option
 Event = Dict[str, object]
 
 
-def iter_journal_events(args: argparse.Namespace, dbg: DebugLog, raw_sink: Optional[io.TextIOBase]=None) -> Iterator[Event]:
+def iter_journal_events(
+    args: argparse.Namespace,
+    dbg: DebugLog,
+    raw_sink: Optional[io.TextIOBase] = None,
+    raw_json_writer: Optional[Callable[[Dict[str, object]], None]] = None,
+) -> Iterator[Event]:
     if not have_cmd("journalctl"):
         return
     cmd = build_journalctl_cmd(args, for_count=False)
@@ -640,7 +681,7 @@ def iter_journal_events(args: argparse.Namespace, dbg: DebugLog, raw_sink: Optio
                 ts_iso = None
         else:
             ts_iso = None
-        yield {
+        event = {
             "ts": ts_iso,
             "level": level,
             "level_name": LEVEL_NAMES.get(level, str(level) if level is not None else None),
@@ -652,6 +693,12 @@ def iter_journal_events(args: argparse.Namespace, dbg: DebugLog, raw_sink: Optio
             "msg": msg,
             "cursor": obj.get("__CURSOR"),
         }
+        if raw_json_writer is not None:
+            try:
+                raw_json_writer(obj)
+            except Exception:
+                pass
+        yield event
     if p.stdout:
         p.stdout.close()
     _, err = p.communicate()
@@ -1464,6 +1511,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         debug_path = fname("debug", "log") if args.debug else None
         events_path = fname("events", "jsonl") if args.json else None
         insights_path = fname("insights", "json") if args.json else None
+        journal_full_path = fname("journal.full", "json") if args.source in ("journal", "both") else None
         raw_path = fname(
             "raw.journal" if args.source=="journal" else ("raw.dmesg" if args.source=="dmesg" else "raw.mixed"),
             "jsonl" if args.source=="journal" else "log"
@@ -1474,7 +1522,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.stream_only:
             md_path = None
             debug_path = None
-            events_path = insights_path = raw_path = thinking_path = None
+            events_path = insights_path = raw_path = thinking_path = journal_full_path = None
         else:
             if args.outfile:
                 md_path = subst_placeholders(Path(args.outfile), run_id, model_tag)
@@ -1483,6 +1531,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                 md_path = Path.cwd() / f"{APP_NAME}_{run_id}{model_suffix}_report.md"
             debug_path = (md_path.with_name(md_path.stem + "_debug.log")) if args.debug else None
             events_path = insights_path = raw_path = thinking_path = None
+            journal_full_path = None
+            if args.source in ("journal", "both"):
+                base = md_path
+                stem = base.stem[:-7] if base.stem.endswith("_report") else base.stem
+                journal_full_path = base.with_name(f"{stem}_journal.json")
 
     # Debug logger
     dbg = DebugLog(enabled=bool(args.debug))
@@ -1520,6 +1573,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if raw_path is not None:
         raw_f = raw_path.open("w", encoding="utf-8")
 
+    journal_json_writer: Optional[JsonArrayWriter] = None
+    if journal_full_path is not None:
+        try:
+            journal_json_writer = JsonArrayWriter(journal_full_path)
+        except OSError as e:
+            print(f"Failed to prepare {journal_full_path.name}: {e}", file=sys.stderr)
+            journal_full_path = None
+            journal_json_writer = None
+
     # Build iterators & apply cap
     def limited(iterable: Iterator[Event], limit: Optional[int]) -> Iterator[Event]:
         if limit is None:
@@ -1534,7 +1596,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     iters: List[Iterator[Event]] = []
     if args.source in ("journal", "both"):
-        iters.append(iter_journal_events(args, dbg, raw_sink=raw_f))
+        writer_cb = journal_json_writer.append if journal_json_writer else None
+        iters.append(iter_journal_events(args, dbg, raw_sink=raw_f, raw_json_writer=writer_cb))
     if args.source in ("dmesg", "both"):
         iters.append(iter_dmesg_events(args, dbg, raw_sink=raw_f))
 
@@ -1547,10 +1610,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Collect
     collected: List[Event] = []
-    for ev in events_iter:
-        collected.append(ev)
-    if raw_f:
-        raw_f.close()
+    try:
+        for ev in events_iter:
+            collected.append(ev)
+    finally:
+        if raw_f:
+            raw_f.close()
+        if journal_json_writer is not None:
+            journal_json_writer.close()
 
     if not collected:
         print("No events matched the filters.", file=sys.stderr)
@@ -1621,7 +1688,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         dbg.flush_to(debug_path)
 
     output_files: List[Path] = []
-    for candidate in (md_path, events_path, insights_path, raw_path, debug_path, thinking_path):
+    for candidate in (
+        md_path,
+        events_path,
+        insights_path,
+        raw_path,
+        debug_path,
+        thinking_path,
+        journal_full_path,
+    ):
         if candidate is not None and candidate.exists():
             output_files.append(candidate)
 

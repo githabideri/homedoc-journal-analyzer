@@ -70,6 +70,14 @@ homedoc-journal-analyzer --all --tag-model --outdir ~/Obsidian/IT/homedoc/runs
 lyseur --all --tag-model --outdir ~/Obsidian/IT/homedoc/runs
 ```
 
+### Outputs and artifacts
+
+- Markdown triage report (always when not streaming only).
+- `journal.full_<ts>[_<model>].json` — complete JSON array of every journalctl event that was analyzed (written whenever the
+  journal source is in scope, regardless of other artifact flags).
+- Optional extras when the respective flags are enabled: clustered events (`events_*.jsonl`), insights summary (`insights_*.json`),
+  raw log capture (`raw.*`), debug stream transcript, and thinking traces.
+
 ## Key flags
 
 - `--source journal|dmesg|both` (default: journal)
