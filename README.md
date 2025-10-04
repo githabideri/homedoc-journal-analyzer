@@ -10,7 +10,7 @@ If you want to commit, feel free to fork, mess around and put "ai slop" on my "a
 
 # HomeDoc — Journal Analyzer
 
-![version](https://img.shields.io/badge/version-0.1.1-blue.svg)
+![version](https://img.shields.io/badge/version-0.1.2-blue.svg)
 ![license](https://img.shields.io/badge/license-GPLv3-blue.svg)
 
 Single-file, stdlib-only utility that:
@@ -82,10 +82,39 @@ lyseur --all --tag-model --outdir ~/Obsidian/IT/homedoc/runs
   - `--md` (default), `--json`, `--log`, `--all`
 - **LLM**
   - `--server` (alias of `--model-url`), `--model` (default: qwen3:14b), `--no-llm`
+- **Handoff**
+  - `--handoff w --openwebui BASE [--token TOKEN] [--open-browser]` (OpenWebUI ≥ 0.6.15)
+  - `OPENWEBUI_TOKEN` env var (or prompt) provides the Bearer token when `--token` is omitted
+  - `--allow-unstable-openwebui` overrides the version gate if you must target older servers
 - `--quick` (1h journal errors, gemma3:4b, streamed output without thinking), `--interactive`
 - `--show-thinking` (include the model's `<thinking>` block in terminal/file outputs)
 - **Guards**
   - `--max-entries`, `--limit`, `--yes`, `--no`
+
+### OpenWebUI handoff (`--handoff w`)
+
+Release v0.1.2 introduces a stateless OpenWebUI bridge that uploads the Markdown + JSON artifacts from the current run, stores them in a fresh knowledge collection, and seeds a visible chat with the existing assistant summary followed by a kickoff question.
+
+```bash
+homedoc-journal-analyzer \
+  --handoff w \
+  --openwebui https://openwebui.example \
+  --token sk-... \
+  --open-browser
+```
+
+What happens:
+
+1. Token sanity-check via `GET /api/models` (401 triggers a single masked re-prompt).
+2. `report.md` and `report.json` upload to `/api/v1/files/upload`.
+3. A `homedoc-run-<timestamp>` knowledge collection (or collection fallback) is created and bound to those files.
+4. A chat titled `homedoc run — <YYYY-MM-DD HH:MM>` is created with the previous assistant output and a starter user turn.
+5. `/api/chat/completions` runs once to ensure the reply appears in the UI thread.
+6. The script prints both the OpenWebUI home link and the deep link (`/c/<chat_id>`), opening them automatically when `--open-browser` is set.
+
+Tokens are never persisted: discovery order is CLI `--token`, then `OPENWEBUI_TOKEN`, then a masked prompt (if interactive). Servers older than 0.6.15 are blocked unless you pass `--allow-unstable-openwebui`.
+
+Interactive runs that opt into OpenWebUI will automatically save the Markdown and JSON artifacts under `./artifacts/` (timestamped filenames) before the handoff, so you don't need to re-run with different output settings.
 
 ## Update
 
