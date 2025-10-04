@@ -45,17 +45,23 @@ from __future__ import annotations
 import argparse
 import collections
 import datetime as dt
+import getpass
 import io
 import json
+import mimetypes
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+import webbrowser
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
@@ -169,6 +175,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--show-thinking", action="store_true",
                    help="Include the model's <thinking> block in terminal/file outputs")
 
+    # OpenWebUI handoff
+    p.add_argument("--openwebui", action="store_true",
+                   help="Upload outputs to an OpenWebUI chat and open the chat in a browser")
+    p.add_argument("--openwebui-base", default=os.environ.get("HOMEDOC_OPENWEBUI_BASE"),
+                   help="OpenWebUI base URL (e.g. https://openwebui.example.com)")
+    p.add_argument("--openwebui-token", default=os.environ.get("HOMEDOC_OPENWEBUI_TOKEN"),
+                   help="OpenWebUI API token for the configured user")
+
     # Redaction
     p.add_argument("--redact", default=None,
                    help="Comma-separated: ips,macs,nums,hex (applies to outputs, not internal clustering)")
@@ -176,6 +190,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     args = p.parse_args(argv)
 
     setattr(args, "stream_only", False)
+
+    if not getattr(args, "openwebui", False):
+        env_toggle = os.environ.get("HOMEDOC_OPENWEBUI")
+        if env_toggle and env_toggle.strip().lower() in {"1", "true", "yes", "on"}:
+            args.openwebui = True
 
     # Output defaults
     if not (args.md or args.json or args.log or args.debug or args.all):
@@ -383,6 +402,44 @@ def run_interactive_wizard(args: argparse.Namespace, provided_options: Optional[
             args.show_thinking = True
         elif think_choice in ("n", "no"):
             args.show_thinking = False
+
+    try:
+        ow_choice = input(
+            f"Send results to OpenWebUI? [y/N] (currently {'on' if args.openwebui else 'off'}): "
+        ).strip().lower()
+    except EOFError:
+        ow_choice = ""
+
+    if ow_choice in ("y", "yes"):
+        args.openwebui = True
+    elif ow_choice in ("n", "no"):
+        args.openwebui = False
+
+    if args.openwebui:
+        default_base = args.openwebui_base or os.environ.get("HOMEDOC_OPENWEBUI_BASE") or ""
+        base_prompt = "OpenWebUI base URL (e.g. https://host)" + (
+            f" [default {default_base}]" if default_base else ""
+        ) + ": "
+        try:
+            base_choice = input(base_prompt).strip()
+        except EOFError:
+            base_choice = ""
+        if base_choice:
+            args.openwebui_base = base_choice
+        elif default_base and not args.openwebui_base:
+            args.openwebui_base = default_base
+
+        token_prompt = "OpenWebUI API token"
+        if args.openwebui_token:
+            token_prompt += " [press Enter to reuse existing]"
+        token_prompt += ": "
+        try:
+            token_choice = getpass.getpass(token_prompt)
+        except EOFError:
+            token_choice = ""
+        if token_choice:
+            args.openwebui_token = token_choice
+
     print("")
 
 # -------------------------------
@@ -873,6 +930,452 @@ def make_report_md(run_meta: Dict[str, str], clusters: List[Cluster], llm_md: Op
     return "\n".join(lines)
 
 # -------------------------------
+# OpenWebUI integration
+# -------------------------------
+
+
+class OpenWebUIError(Exception):
+    pass
+
+
+def normalize_openwebui_base(raw: Optional[str]) -> Optional[str]:
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", s):
+        s = "https://" + s
+    parsed = urllib.parse.urlparse(s)
+    scheme = parsed.scheme or "https"
+    netloc = parsed.netloc or parsed.path
+    if not netloc:
+        return None
+    path = parsed.path if parsed.netloc else ""
+    normalized_path = path.rstrip("/")
+    return urllib.parse.urlunparse((scheme, netloc, normalized_path, "", "", ""))
+
+
+class OpenWebUIClient:
+    def __init__(self, base: str, token: str, dbg: DebugLog, timeout: float = 30.0):
+        norm_base = normalize_openwebui_base(base)
+        if not norm_base:
+            raise OpenWebUIError("Invalid OpenWebUI base URL")
+        if not token:
+            raise OpenWebUIError("OpenWebUI token is required")
+        self.base = norm_base.rstrip("/")
+        self.token = token.strip()
+        self.dbg = dbg
+        self.timeout = timeout
+
+    def _url(self, path: str) -> str:
+        return urllib.parse.urljoin(self.base + "/", path.lstrip("/"))
+
+    def request(self, method: str, path: str, *, data: Optional[bytes] = None,
+                json_data: Optional[Dict[str, object]] = None,
+                headers: Optional[Dict[str, str]] = None, expect_json: bool = True) -> object:
+        req_headers = {"Authorization": f"Bearer {self.token}"}
+        if headers:
+            req_headers.update(headers)
+        body: Optional[bytes]
+        if json_data is not None:
+            body = json.dumps(json_data).encode("utf-8")
+            req_headers.setdefault("Content-Type", "application/json")
+        else:
+            body = data
+        req = urllib.request.Request(self._url(path), data=body, method=method, headers=req_headers)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                raw = resp.read()
+                if not expect_json:
+                    return raw
+                if not raw:
+                    return {}
+                encoding = resp.headers.get_content_charset() or "utf-8"
+                return json.loads(raw.decode(encoding))
+        except urllib.error.HTTPError as e:
+            err_body = e.read()
+            snippet = ""
+            if err_body:
+                try:
+                    snippet = err_body.decode("utf-8", errors="replace")
+                except Exception:
+                    snippet = repr(err_body)
+            raise OpenWebUIError(f"{method} {path} failed ({e.code} {e.reason}): {snippet}") from e
+        except urllib.error.URLError as e:
+            raise OpenWebUIError(f"{method} {path} failed: {e}") from e
+
+    def post_chat(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return self.request("POST", "/api/v1/chats/new", json_data=payload)  # type: ignore[return-value]
+
+    def update_chat(self, chat_id: str, chat_state: Dict[str, object]) -> None:
+        self.request("POST", f"/api/v1/chats/{chat_id}", json_data={"chat": chat_state})
+
+    def get_chat(self, chat_id: str) -> Dict[str, object]:
+        resp = self.request("GET", f"/api/v1/chats/{chat_id}")
+        if isinstance(resp, dict):
+            return resp.get("chat") or resp
+        raise OpenWebUIError("Unexpected chat response structure")
+
+    def mark_completed(self, chat_id: str, assistant_id: str, session_id: str, model: str) -> None:
+        payload = {
+            "chat_id": chat_id,
+            "id": assistant_id,
+            "session_id": session_id,
+            "model": model,
+        }
+        self.request("POST", "/api/chat/completed", json_data=payload)
+
+    def upload_file(self, path: Path) -> str:
+        boundary = f"----homedoc{uuid.uuid4().hex}"
+        mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        with path.open("rb") as f:
+            file_bytes = f.read()
+        parts = []
+        parts.append(f"--{boundary}\r\n".encode("utf-8"))
+        disposition = (
+            f"Content-Disposition: form-data; name=\"file\"; filename=\"{path.name}\"\r\n"
+        )
+        parts.append(disposition.encode("utf-8"))
+        parts.append(f"Content-Type: {mime}\r\n\r\n".encode("utf-8"))
+        parts.append(file_bytes)
+        parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+        body = b"".join(parts)
+        headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+        resp = self.request(
+            "POST",
+            "/api/v1/files/?process=true&process_in_background=false",
+            data=body,
+            headers=headers,
+        )
+        if not isinstance(resp, dict):
+            raise OpenWebUIError("Invalid response while uploading file")
+        for key in ("id", "_id", "file_id"):
+            val = resp.get(key)
+            if isinstance(val, str) and val:
+                return val
+        data_obj = resp.get("data")
+        if isinstance(data_obj, dict):
+            candidate = data_obj.get("id")
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        raise OpenWebUIError("Could not extract file id from upload response")
+
+    def wait_file_ready(self, file_id: str) -> None:
+        for _ in range(60):
+            resp = self.request("GET", f"/api/v1/files/{file_id}/process/status")
+            if isinstance(resp, dict) and resp.get("status") == "completed":
+                return
+            time.sleep(1)
+        raise OpenWebUIError(f"Timeout while waiting for file {file_id} to process")
+
+    def create_knowledge(self, name: str, description: str) -> Tuple[str, Dict[str, object]]:
+        payload = {"name": name, "description": description}
+        for endpoint in ("/api/v1/knowledge/create", "/api/v1/knowledge"):
+            try:
+                resp = self.request("POST", endpoint, json_data=payload)
+            except OpenWebUIError:
+                continue
+            if isinstance(resp, dict):
+                for key in ("id", "_id", "knowledge_id"):
+                    val = resp.get(key)
+                    if isinstance(val, str) and val:
+                        return val, resp
+        raise OpenWebUIError("Could not create knowledge collection")
+
+    def attach_file_to_knowledge(self, knowledge_id: str, file_id: str) -> None:
+        payload = {"file_id": file_id}
+        self.request("POST", f"/api/v1/knowledge/{knowledge_id}/file/add", json_data=payload)
+
+    def get_knowledge(self, knowledge_id: str) -> Dict[str, object]:
+        resp = self.request("GET", f"/api/v1/knowledge/{knowledge_id}")
+        if isinstance(resp, dict):
+            return resp
+        raise OpenWebUIError("Unexpected knowledge response structure")
+
+
+def _shorten(s: str, limit: int = 160) -> str:
+    if len(s) <= limit:
+        return s
+    return s[: limit - 1] + "…"
+
+
+def compose_openwebui_user_message(run_meta: Dict[str, str], clusters: List[Cluster]) -> str:
+    lines = [
+        f"homedoc-journal-analyzer triage run at {run_meta.get('timestamp', '-')}",
+        "",
+        "Top findings:",
+    ]
+    if not clusters:
+        lines.append("- No events matched the filters.")
+    else:
+        for cl in clusters[:5]:
+            lines.append(
+                f"- {cl.count}× level(s) {', '.join(LEVEL_NAMES.get(k, str(k)) for k, _ in cl.levels.most_common(2)) or '-'} — {_shorten(cl.signature)}"
+            )
+    lines.append("")
+    lines.append("The full Markdown report and related artifacts are attached.")
+    return "\n".join(lines)
+
+
+def maybe_open_browser(url: str) -> None:
+    try:
+        webbrowser.open(url, new=2)
+    except Exception:
+        pass
+
+
+def handoff_to_openwebui(
+    args: argparse.Namespace,
+    dbg: DebugLog,
+    run_meta: Dict[str, str],
+    clusters: List[Cluster],
+    report_md: Optional[str],
+    llm_md: Optional[str],
+    output_files: List[Path],
+) -> None:
+    if not args.openwebui:
+        return
+
+    base = args.openwebui_base or os.environ.get("HOMEDOC_OPENWEBUI_BASE")
+    token = args.openwebui_token or os.environ.get("HOMEDOC_OPENWEBUI_TOKEN")
+    if not base or not token:
+        print("OpenWebUI handoff requested but base URL or token is missing.", file=sys.stderr)
+        return
+
+    try:
+        client = OpenWebUIClient(base, token, dbg)
+    except OpenWebUIError as e:
+        print(f"OpenWebUI setup failed: {e}", file=sys.stderr)
+        return
+
+    model_name = args.model if args.model else "homedoc"
+    chat_title = f"homedoc triage {run_meta.get('timestamp', time.strftime('%H:%M:%S'))}"
+    user_id = uuid.uuid4().hex
+    assistant_id = uuid.uuid4().hex
+    session_id = uuid.uuid4().hex
+    pivot_ts = int(time.time())
+
+    user_message = compose_openwebui_user_message(run_meta, clusters)
+
+    chat_payload = {
+        "chat": {
+            "title": chat_title,
+            "models": [model_name],
+            "messages": [
+                {
+                    "id": user_id,
+                    "role": "user",
+                    "content": user_message,
+                    "timestamp": pivot_ts,
+                    "models": [model_name],
+                    "parentId": None,
+                    "childrenIds": [],
+                }
+            ],
+            "history": {
+                "current_id": user_id,
+                "messages": {
+                    user_id: {
+                        "id": user_id,
+                        "role": "user",
+                        "content": user_message,
+                        "timestamp": pivot_ts,
+                        "models": [model_name],
+                        "parentId": None,
+                        "childrenIds": [],
+                    }
+                },
+            },
+        }
+    }
+
+    try:
+        resp = client.post_chat(chat_payload)
+    except OpenWebUIError as e:
+        print(f"OpenWebUI chat creation failed: {e}", file=sys.stderr)
+        return
+
+    chat_obj = resp.get("chat") if isinstance(resp, dict) else None
+    if not isinstance(chat_obj, dict):
+        chat_obj = resp if isinstance(resp, dict) else None
+    if not isinstance(chat_obj, dict):
+        print("OpenWebUI returned unexpected chat payload.", file=sys.stderr)
+        return
+    chat_id = chat_obj.get("id")
+    if not isinstance(chat_id, str):
+        print("OpenWebUI chat id missing from response.", file=sys.stderr)
+        return
+
+    try:
+        now_ts = int(time.time())
+        messages = chat_obj.setdefault("messages", [])
+        history = chat_obj.setdefault("history", {})
+        history_messages = history.setdefault("messages", {})
+        assistant_msg = {
+            "id": assistant_id,
+            "role": "assistant",
+            "content": "",
+            "parentId": user_id,
+            "modelName": model_name,
+            "modelIdx": 0,
+            "timestamp": now_ts,
+            "done": False,
+            "statusHistory": [],
+            "childrenIds": [],
+        }
+        messages.append(assistant_msg)
+        for msg in messages:
+            if msg.get("id") == user_id:
+                child_ids = msg.get("childrenIds") or []
+                if assistant_id not in child_ids:
+                    child_ids.append(assistant_id)
+                msg["childrenIds"] = child_ids
+        history_messages[assistant_id] = {
+            "id": assistant_id,
+            "role": "assistant",
+            "content": "",
+            "parentId": user_id,
+            "modelName": model_name,
+            "modelIdx": 0,
+            "timestamp": now_ts,
+            "done": False,
+            "childrenIds": [],
+        }
+        history["current_id"] = assistant_id
+        history["currentId"] = assistant_id
+        chat_obj["currentId"] = assistant_id
+        client.update_chat(chat_id, chat_obj)
+    except OpenWebUIError as e:
+        print(f"OpenWebUI placeholder update failed: {e}", file=sys.stderr)
+        return
+
+    temp_paths: List[Path] = []
+    try:
+        if report_md and not any(p.suffix.lower() == ".md" for p in output_files):
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".md", prefix="homedoc_report_")
+            with tmp:
+                tmp.write(report_md.encode("utf-8"))
+            tmp_path = Path(tmp.name)
+            temp_paths.append(tmp_path)
+            output_files.append(tmp_path)
+
+        uploaded_ids: List[str] = []
+        for path in output_files:
+            if not path.exists():
+                continue
+            try:
+                file_id = client.upload_file(path)
+                client.wait_file_ready(file_id)
+                uploaded_ids.append(file_id)
+            except OpenWebUIError as e:
+                print(f"Failed to upload {path.name} to OpenWebUI: {e}", file=sys.stderr)
+
+        knowledge_id = None
+        knowledge_obj: Optional[Dict[str, object]] = None
+        if uploaded_ids:
+            name = f"homedoc artifacts {time.strftime('%Y%m%d_%H%M%S')}"
+            desc = f"Artifacts for chat {chat_id}"
+            try:
+                knowledge_id, knowledge_obj = client.create_knowledge(name, desc)
+            except OpenWebUIError as e:
+                print(f"OpenWebUI knowledge creation failed: {e}", file=sys.stderr)
+            else:
+                for fid in uploaded_ids:
+                    try:
+                        client.attach_file_to_knowledge(knowledge_id, fid)
+                    except OpenWebUIError as e:
+                        print(f"Failed to attach file {fid} to knowledge {knowledge_id}: {e}", file=sys.stderr)
+                try:
+                    knowledge_obj = client.get_knowledge(knowledge_id)
+                except OpenWebUIError:
+                    knowledge_obj = {"id": knowledge_id, "status": "processed", "type": "collection"}
+
+        try:
+            chat_state = client.get_chat(chat_id)
+        except OpenWebUIError as e:
+            print(f"Failed to refresh OpenWebUI chat: {e}", file=sys.stderr)
+            return
+
+        if knowledge_obj and isinstance(chat_state, dict):
+            payload = dict(knowledge_obj)
+            payload.setdefault("type", "collection")
+            payload.setdefault("status", payload.get("status") or "processed")
+
+            def ensure_entry(container: List[Dict[str, object]]) -> None:
+                payload_id = payload.get("id")
+                for existing in container:
+                    if isinstance(existing, dict) and existing.get("id") == payload_id:
+                        return
+                container.append(payload)
+
+            files = chat_state.setdefault("files", [])
+            if isinstance(files, list):
+                ensure_entry(files)
+            chat_state.setdefault("knowledge_ids", [])
+            if knowledge_id and isinstance(chat_state["knowledge_ids"], list) and knowledge_id not in chat_state["knowledge_ids"]:
+                chat_state["knowledge_ids"].append(knowledge_id)
+            for msg in chat_state.get("messages", []):
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    msg_files = msg.setdefault("files", [])
+                    if isinstance(msg_files, list):
+                        ensure_entry(msg_files)
+            history = chat_state.get("history")
+            if isinstance(history, dict):
+                hist_msgs = history.get("messages")
+                if isinstance(hist_msgs, dict):
+                    for key, val in hist_msgs.items():
+                        if isinstance(val, dict) and val.get("role") == "user":
+                            msg_files = val.setdefault("files", [])
+                            if isinstance(msg_files, list):
+                                ensure_entry(msg_files)
+
+        assistant_content = llm_md.strip() if llm_md else None
+        if not assistant_content and report_md:
+            assistant_content = (
+                "LLM summary was not generated. See the attached Markdown report for full details.\n\n"
+                + _shorten(report_md, 4000)
+            )
+        if not assistant_content:
+            assistant_content = "Report uploaded. Review the attached artifacts for full details."
+
+        if isinstance(chat_state, dict):
+            for msg in chat_state.get("messages", []):
+                if isinstance(msg, dict) and msg.get("id") == assistant_id:
+                    msg["content"] = assistant_content
+                    msg["done"] = True
+            history = chat_state.get("history")
+            if isinstance(history, dict):
+                hist_msgs = history.get("messages")
+                if isinstance(hist_msgs, dict):
+                    entry = hist_msgs.get(assistant_id)
+                    if isinstance(entry, dict):
+                        entry["content"] = assistant_content
+                        entry["done"] = True
+                history["current_id"] = assistant_id
+                history["currentId"] = assistant_id
+            chat_state["currentId"] = assistant_id
+            try:
+                client.update_chat(chat_id, chat_state)
+            except OpenWebUIError as e:
+                print(f"Failed to finalize OpenWebUI chat content: {e}", file=sys.stderr)
+                return
+
+        try:
+            client.mark_completed(chat_id, assistant_id, session_id, model_name)
+        except OpenWebUIError as e:
+            print(f"Failed to mark OpenWebUI chat completed: {e}", file=sys.stderr)
+
+        chat_url = f"{client.base}/c/{chat_id}"
+        info(f"OpenWebUI chat ready: {chat_url}")
+        if not VERBOSE:
+            print(f"OpenWebUI chat ready: {chat_url}")
+        maybe_open_browser(chat_url)
+    finally:
+        for tmp in temp_paths:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+# -------------------------------
 # Main
 # -------------------------------
 
@@ -1073,9 +1576,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(thinking_text.strip())
             print("\n---")
 
-    # Report
-    if not args.stream_only:
-        meta = {
+    report_meta: Optional[Dict[str, str]] = None
+    report_md_text: Optional[str] = None
+    if (not args.stream_only) or args.openwebui:
+        report_meta = {
             "timestamp": run_dt.strftime("%Y-%m-%d %H:%M:%S %Z"),
             "source": args.source,
             "mode": args.mode,
@@ -1088,13 +1592,35 @@ def main(argv: Optional[List[str]] = None) -> int:
             "server": args.model_url,
         }
         transparency = thinking_text if (args.show_thinking and not folder_mode) else None
-        md = make_report_md(meta, clusters, llm_md, transparency)
-        if md_path is not None:
-            md_path.write_text(md, encoding="utf-8")
+        report_md_text = make_report_md(report_meta, clusters, llm_md, transparency)
+        if not args.stream_only and md_path is not None:
+            md_path.write_text(report_md_text, encoding="utf-8")
 
     # Debug log
     if debug_path is not None:
         dbg.flush_to(debug_path)
+
+    output_files: List[Path] = []
+    for candidate in (md_path, events_path, insights_path, raw_path, debug_path, thinking_path):
+        if candidate is not None and candidate.exists():
+            output_files.append(candidate)
+
+    if report_meta is None:
+        report_meta = {
+            "timestamp": run_dt.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "source": args.source,
+            "mode": args.mode,
+        }
+
+    handoff_to_openwebui(
+        args,
+        dbg,
+        report_meta,
+        clusters,
+        report_md_text,
+        llm_md,
+        output_files,
+    )
 
     # Final status
     if not args.stream_only:
