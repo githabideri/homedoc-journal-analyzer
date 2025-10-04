@@ -1288,6 +1288,60 @@ def attach_files_to_collection(base: str, token: str, container_type: str, conta
             raise
 
 
+def build_openwebui_message(
+    *,
+    msg_id: str,
+    role: str,
+    content: str,
+    model: str,
+    timestamp: int,
+    parent_id: Optional[str],
+    children_ids: Optional[List[str]] = None,
+    done: bool = True,
+) -> Dict[str, Any]:
+    return {
+        "id": msg_id,
+        "role": role,
+        "content": content,
+        "timestamp": timestamp,
+        "models": [model] if model else [],
+        "parentId": parent_id,
+        "childrenIds": list(children_ids or []),
+        "done": done,
+    }
+
+
+def extract_chat_object(payload: object) -> Optional[Dict[str, Any]]:
+    if isinstance(payload, dict):
+        if isinstance(payload.get("chat"), dict):
+            return payload["chat"]
+        data = payload.get("data")
+        if isinstance(data, dict):
+            if isinstance(data.get("chat"), dict):
+                return data["chat"]
+            if "messages" in data:
+                return data
+        if "messages" in payload:
+            return payload
+    return None
+
+
+def ensure_chat_children(chat: Dict[str, Any], parent_id: str, child_id: str) -> None:
+    for msg in chat.get("messages", []):
+        if msg.get("id") == parent_id:
+            children = msg.setdefault("childrenIds", [])
+            if child_id not in children:
+                children.append(child_id)
+            break
+    history = chat.get("history")
+    if isinstance(history, dict):
+        h_messages = history.get("messages")
+        if isinstance(h_messages, dict) and parent_id in h_messages:
+            children = h_messages[parent_id].setdefault("childrenIds", [])
+            if child_id not in children:
+                children.append(child_id)
+
+
 def create_openwebui_chat(
     base: str,
     token: str,
@@ -1296,26 +1350,87 @@ def create_openwebui_chat(
     old_output: str,
     when: dt.datetime,
     container_type: str,
-) -> str:
+    question: str,
+) -> Tuple[str, str]:
     headers = {"Authorization": f"Bearer {token}"}
     title = f"homedoc run — {when.strftime('%Y-%m-%d %H:%M')}"
-    linkage_key = "knowledge_ids" if container_type == "knowledge" else "collection_ids"
-    payload = {
+    now_ts = int(time.time())
+    assistant_seed_id = uuid.uuid4().hex
+    user_id = uuid.uuid4().hex
+    placeholder_id = uuid.uuid4().hex
+    assistant_seed = build_openwebui_message(
+        msg_id=assistant_seed_id,
+        role="assistant",
+        content=old_output,
+        model=model,
+        timestamp=now_ts - 1,
+        parent_id=None,
+        children_ids=[user_id],
+        done=True,
+    )
+    user_message = build_openwebui_message(
+        msg_id=user_id,
+        role="user",
+        content=question,
+        model=model,
+        timestamp=now_ts,
+        parent_id=assistant_seed_id,
+        children_ids=[],
+        done=True,
+    )
+    chat_obj: Dict[str, Any] = {
         "title": title,
+        "models": [model] if model else [],
         "model": model,
         "system": "You are the homedoc assistant. Prefer information from the attached knowledge collection.",
-        linkage_key: [container_id],
-        "messages": [
-            {"role": "assistant", "content": old_output},
-            {"role": "user", "content": "What would you like to know about the computer?"},
-        ],
+        "messages": [assistant_seed, user_message],
+        "history": {
+            "current_id": user_id,
+            "messages": {
+                assistant_seed_id: assistant_seed,
+                user_id: user_message,
+            },
+        },
+        "files": [],
     }
-    url = f"{base}/api/v1/chats"
-    resp = openwebui_request_json("POST", url, headers=headers, json_body=payload)
+    file_type = "collection" if container_type != "knowledge" else "knowledge"
+    chat_obj.setdefault("files", []).append({"type": file_type, "id": container_id})
+    linkage_key = "knowledge_ids" if container_type == "knowledge" else "collection_ids"
+    chat_obj[linkage_key] = [container_id]
+    payload_new = {"chat": chat_obj}
+    resp = openwebui_request_json(
+        "POST",
+        f"{base}/api/v1/chats/new",
+        headers=headers,
+        json_body=payload_new,
+    )
     chat_id = extract_first_id(resp)
     if not chat_id:
         raise RuntimeError("OpenWebUI chat creation returned no id")
-    return chat_id
+    chat_obj["id"] = chat_id
+    placeholder = build_openwebui_message(
+        msg_id=placeholder_id,
+        role="assistant",
+        content="",
+        model=model,
+        timestamp=now_ts,
+        parent_id=user_id,
+        children_ids=[],
+        done=False,
+    )
+    chat_obj["messages"].append(placeholder)
+    history_messages = chat_obj["history"]["messages"]
+    history_messages[placeholder_id] = placeholder
+    chat_obj["history"]["current_id"] = placeholder_id
+    ensure_chat_children(chat_obj, user_id, placeholder_id)
+    payload_update = {"chat": chat_obj}
+    openwebui_request_json(
+        "POST",
+        f"{base}/api/v1/chats/{chat_id}",
+        headers=headers,
+        json_body=payload_update,
+    )
+    return chat_id, placeholder_id
 
 
 def trigger_openwebui_completion(
@@ -1324,18 +1439,36 @@ def trigger_openwebui_completion(
     model: str,
     chat_id: str,
     container_id: str,
+    container_type: str,
     old_output: str,
-):
+    question: str,
+    assistant_message_id: str,
+) -> str:
     headers = {"Authorization": f"Bearer {token}"}
+    session_id = str(uuid.uuid4())
+    file_type = "collection" if container_type != "knowledge" else "knowledge"
     payload = {
         "model": model,
         "chat_id": chat_id,
+        "id": assistant_message_id,
+        "session_id": session_id,
         "messages": [
             {"role": "assistant", "content": old_output},
-            {"role": "user", "content": "What would you like to know about the computer?"},
+            {"role": "user", "content": question},
         ],
-        "files": [{"type": "collection", "id": container_id}],
+        "files": [{"type": file_type, "id": container_id}],
         "stream": False,
+        "background_tasks": {
+            "title_generation": False,
+            "tags_generation": False,
+            "follow_up_generation": False,
+        },
+        "features": {
+            "code_interpreter": False,
+            "web_search": False,
+            "image_generation": False,
+            "memory": False,
+        },
     }
     url_primary = f"{base}/api/chat/completions"
     try:
@@ -1344,7 +1477,134 @@ def trigger_openwebui_completion(
         if e.code != 404:
             raise
         url_fallback = f"{base}/v1/chat/completions"
-        openwebui_request_json("POST", url_fallback, headers=headers, json_body=payload, timeout=120)
+        openwebui_request_json(
+            "POST", url_fallback, headers=headers, json_body=payload, timeout=120
+        )
+    return session_id
+
+
+def poll_openwebui_chat(
+    base: str,
+    token: str,
+    chat_id: str,
+    assistant_message_id: str,
+    timeout: float = 180.0,
+) -> Dict[str, Any]:
+    headers = {"Authorization": f"Bearer {token}"}
+    deadline = time.time() + timeout
+    url = f"{base}/api/v1/chats/{chat_id}"
+    last_payload: Optional[Dict[str, Any]] = None
+    while time.time() < deadline:
+        payload = openwebui_request("GET", url, headers=headers, timeout=30)
+        chat_obj = extract_chat_object(payload)
+        if isinstance(chat_obj, dict):
+            last_payload = chat_obj
+            messages = chat_obj.get("messages") if isinstance(chat_obj.get("messages"), list) else []
+            history = chat_obj.get("history") if isinstance(chat_obj.get("history"), dict) else {}
+            history_messages = history.get("messages") if isinstance(history.get("messages"), dict) else {}
+            target_msg = None
+            for msg in messages:
+                if isinstance(msg, dict) and msg.get("id") == assistant_message_id:
+                    target_msg = msg
+                    break
+            history_msg = history_messages.get(assistant_message_id)
+            content = None
+            done = False
+            if isinstance(target_msg, dict) and target_msg.get("content"):
+                content = target_msg.get("content")
+                done = bool(target_msg.get("done", False))
+            elif isinstance(history_msg, dict) and history_msg.get("content"):
+                content = history_msg.get("content")
+                done = bool(history_msg.get("done", False))
+            if content:
+                if isinstance(target_msg, dict):
+                    target_msg["done"] = True
+                if isinstance(history_msg, dict):
+                    history_msg["done"] = True
+                if isinstance(chat_obj.get("history"), dict):
+                    chat_obj["history"]["current_id"] = assistant_message_id
+                if isinstance(target_msg, dict) and isinstance(history_msg, dict):
+                    target_msg.setdefault("childrenIds", history_msg.get("childrenIds", []))
+                return chat_obj
+        time.sleep(1.5)
+    if last_payload is not None:
+        return last_payload
+    raise TimeoutError("Timed out waiting for OpenWebUI completion")
+
+
+def sync_openwebui_chat(
+    base: str,
+    token: str,
+    chat_id: str,
+    chat_payload: Dict[str, Any],
+    assistant_message_id: str,
+) -> None:
+    headers = {"Authorization": f"Bearer {token}"}
+    messages = chat_payload.get("messages") if isinstance(chat_payload.get("messages"), list) else []
+    history = chat_payload.get("history") if isinstance(chat_payload.get("history"), dict) else {}
+    history_messages = history.get("messages") if isinstance(history.get("messages"), dict) else {}
+    target_msg = None
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("id") == assistant_message_id:
+            target_msg = msg
+            break
+    history_msg = history_messages.get(assistant_message_id)
+    changed = False
+    if isinstance(history_msg, dict):
+        if target_msg is None:
+            messages.append(history_msg)
+            target_msg = history_msg
+            changed = True
+        else:
+            if target_msg.get("content") != history_msg.get("content"):
+                target_msg["content"] = history_msg.get("content")
+                changed = True
+            if bool(target_msg.get("done")) != bool(history_msg.get("done")):
+                done_value = bool(history_msg.get("done"))
+                target_msg["done"] = done_value
+                history_msg["done"] = done_value
+                changed = True
+    if isinstance(target_msg, dict):
+        if not target_msg.get("content"):
+            return
+        if target_msg.get("done") is not True:
+            target_msg["done"] = True
+            changed = True
+        if isinstance(history_msg, dict) and history_msg.get("done") is not True:
+            history_msg["done"] = True
+            changed = True
+    if changed:
+        chat_payload.setdefault("id", chat_id)
+        openwebui_request_json(
+            "POST",
+            f"{base}/api/v1/chats/{chat_id}",
+            headers=headers,
+            json_body={"chat": chat_payload},
+        )
+
+
+def complete_openwebui_session(
+    base: str,
+    token: str,
+    chat_id: str,
+    assistant_message_id: str,
+    model: str,
+    session_id: str,
+) -> None:
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {
+        "chat_id": chat_id,
+        "id": assistant_message_id,
+        "session_id": session_id,
+        "model": model,
+    }
+    openwebui_request_json(
+        "POST",
+        f"{base}/api/chat/completed",
+        headers=headers,
+        json_body=payload,
+        timeout=60,
+    )
 
 
 def fetch_openwebui_version(base: str, token: Optional[str]) -> Optional[str]:
@@ -1502,10 +1762,45 @@ def run_openwebui_handoff(
         attach_files_to_collection(base, token, container_type, container_id, [file_md_id, file_json_id])
 
         llm_seed = llm_md or md_abs.read_text(encoding="utf-8")
+        first_question = "What would you like to know about the computer?"
         info("Creating OpenWebUI chat thread…")
-        chat_id = create_openwebui_chat(base, token, handoff_model, container_id, llm_seed, run_dt, container_type)
+        chat_id, assistant_message_id = create_openwebui_chat(
+            base,
+            token,
+            handoff_model,
+            container_id,
+            llm_seed,
+            run_dt,
+            container_type,
+            first_question,
+        )
         info("Triggering OpenWebUI completion…")
-        trigger_openwebui_completion(base, token, handoff_model, chat_id, container_id, llm_seed)
+        session_id = trigger_openwebui_completion(
+            base,
+            token,
+            handoff_model,
+            chat_id,
+            container_id,
+            container_type,
+            llm_seed,
+            first_question,
+            assistant_message_id,
+        )
+        info("Waiting for OpenWebUI response…")
+        chat_payload = poll_openwebui_chat(base, token, chat_id, assistant_message_id)
+        sync_openwebui_chat(base, token, chat_id, chat_payload, assistant_message_id)
+        try:
+            complete_openwebui_session(
+                base,
+                token,
+                chat_id,
+                assistant_message_id,
+                handoff_model,
+                session_id,
+            )
+        except urllib.error.HTTPError as completion_err:
+            if completion_err.code not in (404, 405):
+                raise
         base = effective_openwebui_base(base)
     except urllib.error.HTTPError as e:
         print(f"OpenWebUI API error (HTTP {e.code}): {e.reason}", file=sys.stderr)
