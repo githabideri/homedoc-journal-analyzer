@@ -1251,16 +1251,21 @@ def upload_openwebui_file(base: str, token: str, path: Path) -> str:
 def create_openwebui_collection(base: str, token: str, name: str, description: str) -> Tuple[str, str]:
     headers = {"Authorization": f"Bearer {token}"}
     payload = {"name": name, "description": description}
-    url = f"{base}/api/v1/knowledge"
-    try:
-        resp = openwebui_request_json("POST", url, headers=headers, json_body=payload)
-        cid = extract_first_id(resp)
-        if not cid:
-            raise RuntimeError("OpenWebUI knowledge creation returned no id")
-        return "knowledge", cid
-    except urllib.error.HTTPError as e:
-        if e.code != 404:
-            raise
+    knowledge_urls = [
+        f"{base}/api/v1/knowledge/create",
+        f"{base}/api/v1/knowledge",
+    ]
+    for url in knowledge_urls:
+        try:
+            resp = openwebui_request_json("POST", url, headers=headers, json_body=payload)
+            cid = extract_first_id(resp)
+            if not cid:
+                raise RuntimeError("OpenWebUI knowledge creation returned no id")
+            return "knowledge", cid
+        except urllib.error.HTTPError as e:
+            # fall back to the next option for 404/405 so we support mixed server versions
+            if e.code not in (404, 405):
+                raise
     url = f"{base}/api/v1/collections"
     resp = openwebui_request_json("POST", url, headers=headers, json_body=payload)
     cid = extract_first_id(resp)
@@ -1275,8 +1280,22 @@ def attach_files_to_collection(base: str, token: str, container_type: str, conta
         url = f"{base}/api/v1/knowledge/{container_id}/file/add"
     else:
         url = f"{base}/api/v1/collections/{container_id}/files"
-    payload = {"file_ids": file_ids}
     retries = 5
+    if container_type == "knowledge":
+        for file_id in file_ids:
+            payload = {"file_id": file_id}
+            for attempt in range(retries):
+                try:
+                    openwebui_request_json("POST", url, headers=headers, json_body=payload)
+                    break
+                except urllib.error.HTTPError as e:
+                    if e.code in (409, 422, 425, 503) and attempt < retries - 1:
+                        time.sleep(0.4 + random.random() * 0.4)
+                        continue
+                    raise
+        return
+
+    payload = {"file_ids": file_ids}
     for attempt in range(retries):
         try:
             openwebui_request_json("POST", url, headers=headers, json_body=payload)
