@@ -70,6 +70,14 @@ homedoc-journal-analyzer --all --tag-model --outdir ~/Obsidian/IT/homedoc/runs
 lyseur --all --tag-model --outdir ~/Obsidian/IT/homedoc/runs
 ```
 
+### Outputs and artifacts
+
+- Markdown triage report (always when not streaming only).
+- `journal.full_<ts>[_<model>].json` — complete JSON array of every journalctl event that was analyzed (written whenever the
+  journal source is in scope, regardless of other artifact flags).
+- Optional extras when the respective flags are enabled: clustered events (`events_*.jsonl`), insights summary (`insights_*.json`),
+  raw log capture (`raw.*`), debug stream transcript, and thinking traces.
+
 ## Key flags
 
 - `--source journal|dmesg|both` (default: journal)
@@ -86,6 +94,26 @@ lyseur --all --tag-model --outdir ~/Obsidian/IT/homedoc/runs
 - `--show-thinking` (include the model's `<thinking>` block in terminal/file outputs)
 - **Guards**
   - `--max-entries`, `--limit`, `--yes`, `--no`
+- **OpenWebUI hand-off**
+  - `--openwebui` uploads the generated Markdown report (and any extra artifacts) to an OpenWebUI chat, seeds the first assistant
+    reply with the local LLM summary, links a knowledge collection, and opens the chat in your browser.
+  - Provide credentials via `--openwebui-base` / `--openwebui-token` or set `HOMEDOC_OPENWEBUI_BASE` / `HOMEDOC_OPENWEBUI_TOKEN`.
+  - The interactive wizard prompts for the base URL and token when you enable the hand-off.
+
+## OpenWebUI workflow
+
+When `--openwebui` is enabled the script:
+
+1. Creates a fresh chat seeded with the triage metadata and top cluster summary.
+2. Uploads the Markdown report and any other generated artifacts, waits for OpenWebUI to process them, and stores them in a new
+   knowledge collection.
+3. Links the knowledge collection to the chat so the attachments show up immediately alongside the seeded user turn.
+4. Prefills the assistant response with the local LLM's Markdown summary (or a fallback note when the LLM was disabled).
+5. Marks the assistant turn as complete and launches your browser directly to the new chat so you can continue the
+   investigation inside OpenWebUI.
+
+> Tip: the token is a standard OpenWebUI API token (same as used by their CLI). Store it in `HOMEDOC_OPENWEBUI_TOKEN` if you
+> don't want to pass it on every invocation.
 
 ## Update
 
