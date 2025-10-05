@@ -24,4 +24,7 @@ Thumbs.db
 
 # Project artifacts
 homedoc_journal_analyzer_*/
+lyseur_*
+lyser_*
+artifacts/
 *.log
