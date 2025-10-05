@@ -1188,10 +1188,22 @@ def handoff_to_openwebui(
         print("OpenWebUI handoff requested but base URL or token is missing.", file=sys.stderr)
         return
 
+    client: Optional[OpenWebUIClient] = None
+
+    def abort(stage: str, error: Exception) -> None:
+        dbg.log(f"OpenWebUI hand-off aborted during {stage}: {error}")
+        origin = getattr(client, "base", None) or base or "OpenWebUI"
+        msg = (
+            f"OpenWebUI hand-off skipped ({origin}, stage={stage}): {error}. "
+            "Outputs remain local only."
+        )
+        print(msg, file=sys.stderr)
+        info(msg)
+
     try:
         client = OpenWebUIClient(base, token, dbg)
     except OpenWebUIError as e:
-        print(f"OpenWebUI setup failed: {e}", file=sys.stderr)
+        abort("setup", e)
         return
 
     model_name = args.model if args.model else "homedoc"
@@ -1238,7 +1250,7 @@ def handoff_to_openwebui(
     try:
         resp = client.post_chat(chat_payload)
     except OpenWebUIError as e:
-        print(f"OpenWebUI chat creation failed: {e}", file=sys.stderr)
+        abort("chat creation", e)
         return
 
     chat_id: Optional[str] = None
@@ -1269,7 +1281,7 @@ def handoff_to_openwebui(
         try:
             chat_obj = client.get_chat(chat_id)
         except OpenWebUIError as e:
-            print(f"Failed to refresh OpenWebUI chat: {e}", file=sys.stderr)
+            abort("chat refresh", e)
             return
 
     try:
@@ -1312,7 +1324,7 @@ def handoff_to_openwebui(
         chat_obj["currentId"] = assistant_id
         client.update_chat(chat_id, chat_obj)
     except OpenWebUIError as e:
-        print(f"OpenWebUI placeholder update failed: {e}", file=sys.stderr)
+        abort("placeholder", e)
         return
 
     temp_paths: List[Path] = []
@@ -1359,7 +1371,7 @@ def handoff_to_openwebui(
         try:
             chat_state = client.get_chat(chat_id)
         except OpenWebUIError as e:
-            print(f"Failed to refresh OpenWebUI chat: {e}", file=sys.stderr)
+            abort("chat refresh", e)
             return
 
         if knowledge_obj and isinstance(chat_state, dict):
@@ -1423,13 +1435,14 @@ def handoff_to_openwebui(
             try:
                 client.update_chat(chat_id, chat_state)
             except OpenWebUIError as e:
-                print(f"Failed to finalize OpenWebUI chat content: {e}", file=sys.stderr)
+                abort("finalize", e)
                 return
 
         try:
             client.mark_completed(chat_id, assistant_id, session_id, model_name)
         except OpenWebUIError as e:
-            print(f"Failed to mark OpenWebUI chat completed: {e}", file=sys.stderr)
+            abort("completion", e)
+            return
 
         chat_url = f"{client.base}/c/{chat_id}"
         info(f"OpenWebUI chat ready: {chat_url}")
