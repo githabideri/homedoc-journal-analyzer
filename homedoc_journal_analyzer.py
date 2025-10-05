@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
- homedoc_journal_analyzer v0.1.1
+ homedoc_journal_analyzer v0.1.2
 
  Single-file, stdlib-only journalctl/dmesg analyzer with optional local LLM summary.
 
@@ -73,7 +73,7 @@ _RAW_PROG = Path(sys.argv[0]).stem if sys.argv else "homedoc-journal-analyzer"
 APP_NAME = _RAW_PROG.replace("_", "-")
 if APP_NAME not in {"homedoc-journal-analyzer", "lyseur"}:
     APP_NAME = "homedoc-journal-analyzer"
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 # Align with homedoc flags/env: prefer HOMEDOC_SERVER; keep HOMEDOC_MODEL_URL for compatibility
 DEFAULT_MODEL_URL = (
     os.environ.get("HOMEDOC_SERVER")

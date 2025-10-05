@@ -1,7 +1,13 @@
 # Changelog
 
 ## Unreleased
-- Document `lyseur` as an alias for the `homedoc-journal-analyzer` CLI and publish it as an additional console script.
+- _Nothing yet_
+
+## 0.1.2 — 2025-10-05
+- Add OpenWebUI hand-off workflow that seeds a chat, uploads artifacts, and links a knowledge collection.
+- Gracefully skip OpenWebUI integration when credentials or network access are missing instead of failing.
+- Export full `journalctl` JSON dumps alongside clustered insights for better forensic follow-up.
+- Document `lyseur` as an alias for the `homedoc-journal-analyzer` CLI and expose it as an additional console script.
 
 ## 0.1.1 — 2025-10-01
 - Normalize `--server` to assume `http://<host>:11434/api/generate` while still accepting full URLs.
