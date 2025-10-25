@@ -3,6 +3,12 @@
 ## Unreleased
 - _Nothing yet_
 
+## 0.1.3 — 2025-10-25
+- Prevent preflight `journalctl` counts from crashing the CLI by timing out and cleaning up long-running processes.
+- Honor `--limit` even when preflight totals are zero and reject non-positive limits up front.
+- Enforce `--flat` exclusivity against folder-mode flags to avoid silent folder outputs.
+- Ship a populated `.env.example` documenting LLM and OpenWebUI environment variables.
+
 ## 0.1.2 — 2025-10-05
 - Add OpenWebUI hand-off workflow that seeds a chat, uploads artifacts, and links a knowledge collection.
 - Gracefully skip OpenWebUI integration when credentials or network access are missing instead of failing.

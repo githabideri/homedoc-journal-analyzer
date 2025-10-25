@@ -73,7 +73,7 @@ _RAW_PROG = Path(sys.argv[0]).stem if sys.argv else "homedoc-journal-analyzer"
 APP_NAME = _RAW_PROG.replace("_", "-")
 if APP_NAME not in {"homedoc-journal-analyzer", "lyseur"}:
     APP_NAME = "homedoc-journal-analyzer"
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 # Align with homedoc flags/env: prefer HOMEDOC_SERVER; keep HOMEDOC_MODEL_URL for compatibility
 DEFAULT_MODEL_URL = (
     os.environ.get("HOMEDOC_SERVER")
@@ -585,13 +585,20 @@ def count_lines(cmd: List[str], dbg: DebugLog, label: str) -> int:
     n = 0
     if p.stdout is None:
         return 0
-    for _ in p.stdout:
-        n += 1
-        if n > DEFAULT_MAX_ENTRIES * 5:
-            break
-    if p.stdout:
-        p.stdout.close()
-    p.wait(timeout=15)
+    try:
+        for _ in p.stdout:
+            n += 1
+            if n > DEFAULT_MAX_ENTRIES * 5:
+                break
+    finally:
+        if p.stdout:
+            p.stdout.close()
+    try:
+        p.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        dbg.log(f"{label} preflight count timed out; terminating process")
+        p.kill()
+        p.communicate()
     dbg.log(f"{label} preflight count ≈ {n}")
     return n
 
@@ -599,7 +606,9 @@ def count_lines(cmd: List[str], dbg: DebugLog, label: str) -> int:
 def interactive_gate(total: int, args: argparse.Namespace) -> Tuple[bool, Optional[int]]:
     """Return (proceed, cap_limit)."""
     if args.limit is not None:
-        return (total > 0 and args.limit > 0), args.limit
+        if args.limit <= 0:
+            return False, None
+        return True, args.limit
 
     if total <= args.max_entries:
         return True, None
@@ -1501,9 +1510,22 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Decide flat vs folder
     extra_artifacts = bool(args.json or args.log or args.debug or args.all)
-    folder_mode = bool(args.outdir) or extra_artifacts or bool(args.no_flat)
-    if args.stream_only:
+    if args.flat and args.no_flat:
+        print("--flat cannot be combined with --no-flat.", file=sys.stderr)
+        return 1
+    if args.flat and args.outdir:
+        print("--flat cannot be combined with --outdir.", file=sys.stderr)
+        return 1
+    if args.flat and extra_artifacts:
+        print("--flat cannot be combined with artifact flags (--json/--log/--debug/--all).", file=sys.stderr)
+        return 1
+
+    if args.flat:
         folder_mode = False
+    else:
+        folder_mode = bool(args.outdir) or extra_artifacts or bool(args.no_flat)
+        if args.stream_only:
+            folder_mode = False
 
     # Run id and model tag
     run_dt = dt.datetime.now().astimezone()
