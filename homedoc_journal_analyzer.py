@@ -73,7 +73,7 @@ _RAW_PROG = Path(sys.argv[0]).stem if sys.argv else "homedoc-journal-analyzer"
 APP_NAME = _RAW_PROG.replace("_", "-")
 if APP_NAME not in {"homedoc-journal-analyzer", "lyseur"}:
     APP_NAME = "homedoc-journal-analyzer"
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 # Align with homedoc flags/env: prefer HOMEDOC_SERVER; keep HOMEDOC_MODEL_URL for compatibility
 DEFAULT_MODEL_URL = (
     os.environ.get("HOMEDOC_SERVER")
@@ -126,58 +126,58 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--version", action="version", version=f"{APP_NAME} {VERSION}")
 
     # Sources & modes
-    p.add_argument("--source", choices=["journal", "dmesg", "both"], default="journal",
+    p.add_argument("-s", "--source", choices=["journal", "dmesg", "both"], default="journal",
                    help="Which source to read (default: journal)")
-    p.add_argument("--mode", default="error",
+    p.add_argument("-m", "--mode", default="error",
                    choices=["error", "warn", "all", "security", "boot", "kernel"],
                    help="Filter preset (default: error)")
-    p.add_argument("--grep", metavar="REGEX", default=None,
+    p.add_argument("-g", "--grep", metavar="REGEX", default=None,
                    help="Additional message filter (regex).")
 
     # Time scoping
-    p.add_argument("--last", default=DEFAULT_LAST,
+    p.add_argument("-l", "--last", default=DEFAULT_LAST,
                    help="journalctl time window, e.g., '2h' '3d' '1w'. Ignored if --since/--until present.")
-    p.add_argument("--since", default=None, help="journalctl --since ISO or 'YYYY-MM-DD HH:MM:SS'")
-    p.add_argument("--until", default=None, help="journalctl --until ISO or 'YYYY-MM-DD HH:MM:SS'")
+    p.add_argument("-B", "--since", default=None, help="journalctl --since ISO or 'YYYY-MM-DD HH:MM:SS'")
+    p.add_argument("-U", "--until", default=None, help="journalctl --until ISO or 'YYYY-MM-DD HH:MM:SS'")
 
     # Volume guard
-    p.add_argument("--max-entries", type=int, default=DEFAULT_MAX_ENTRIES,
+    p.add_argument("-E", "--max-entries", type=int, default=DEFAULT_MAX_ENTRIES,
                    help="Preflight threshold for total entries before prompting (default: 10000)")
-    p.add_argument("--limit", type=int, default=None, help="Hard cap on entries to process (non-interactive)")
-    p.add_argument("--yes", action="store_true", help="Proceed without interactive confirmation")
-    p.add_argument("--no", action="store_true", help="Abort if over threshold without prompt")
+    p.add_argument("-L", "--limit", type=int, default=None, help="Hard cap on entries to process (non-interactive)")
+    p.add_argument("-y", "--yes", action="store_true", help="Proceed without interactive confirmation")
+    p.add_argument("-n", "--no", action="store_true", help="Abort if over threshold without prompt")
 
     # Outputs / layout
-    p.add_argument("--outdir", default=None, help="Output directory (forces folder mode)")
-    p.add_argument("--outfile", default=None, help="(flat) Explicit Markdown output path; supports {ts} and {model}")
-    p.add_argument("--flat", action="store_true", help="Force flat single-file Markdown in CWD or --outfile path")
-    p.add_argument("--no-flat", action="store_true", help="Disable flat mode; always write into a folder")
-    p.add_argument("--stamp-names", action="store_true", help="(folder) Include timestamp in filenames (default)")
-    p.add_argument("--no-stamp-names", action="store_true", help="(folder) Do not include timestamp in filenames")
-    p.add_argument("--tag-model", action="store_true", help="Include model tag in outdir and filenames")
+    p.add_argument("-d", "--outdir", default=None, help="Output directory (forces folder mode)")
+    p.add_argument("-o", "--outfile", default=None, help="(flat) Explicit Markdown output path; supports {ts} and {model}")
+    p.add_argument("-f", "--flat", action="store_true", help="Force flat single-file Markdown in CWD or --outfile path")
+    p.add_argument("-F", "--no-flat", action="store_true", help="Disable flat mode; always write into a folder")
+    p.add_argument("-p", "--stamp-names", action="store_true", help="(folder) Include timestamp in filenames (default)")
+    p.add_argument("-P", "--no-stamp-names", action="store_true", help="(folder) Do not include timestamp in filenames")
+    p.add_argument("-t", "--tag-model", action="store_true", help="Include model tag in outdir and filenames")
 
-    p.add_argument("--md", action="store_true", help="Write Markdown report (default if no outputs chosen)")
-    p.add_argument("--json", action="store_true", help="Write events.jsonl and insights.json (folder mode)")
-    p.add_argument("--log", action="store_true", help="Write raw logs (folder mode)")
-    p.add_argument("--debug", action="store_true", help="Write debug log, including payloads and stream summaries")
-    p.add_argument("--all", action="store_true", help="Write all artifacts (md, json, log, debug) (folder mode)")
+    p.add_argument("-r", "--md", action="store_true", help="Write Markdown report (default if no outputs chosen)")
+    p.add_argument("-j", "--json", action="store_true", help="Write events.jsonl and insights.json (folder mode)")
+    p.add_argument("-G", "--log", action="store_true", help="Write raw logs (folder mode)")
+    p.add_argument("-D", "--debug", action="store_true", help="Write debug log, including payloads and stream summaries")
+    p.add_argument("-a", "--all", action="store_true", help="Write all artifacts (md, json, log, debug) (folder mode)")
 
     # LLM
-    p.add_argument("--server", dest="model_url", help="LLM server URL (alias of --model-url)")
+    p.add_argument("-S", "--server", dest="model_url", help="LLM server URL (alias of --model-url)")
     p.add_argument("--model-url", dest="model_url", default=DEFAULT_MODEL_URL,
                    help="LLM server URL (Ollama /api/generate assumed)")
-    p.add_argument("--model", default=DEFAULT_MODEL_NAME, help="LLM model name (default: qwen3:14b)")
-    p.add_argument("--no-llm", action="store_true", help="Disable LLM summary entirely")
+    p.add_argument("-M", "--model", default=DEFAULT_MODEL_NAME, help="LLM model name (default: qwen3:14b)")
+    p.add_argument("-X", "--no-llm", action="store_true", help="Disable LLM summary entirely")
 
-    p.add_argument("--quick", action="store_true",
+    p.add_argument("-q", "--quick", action="store_true",
                    help="Shortcut: last 1h journal errors, gemma3:4b, stream answer to terminal")
-    p.add_argument("--interactive", action="store_true",
+    p.add_argument("-i", "--interactive", action="store_true",
                    help="Launch interactive helper (default when no flags)")
-    p.add_argument("--show-thinking", action="store_true",
+    p.add_argument("-T", "--show-thinking", action="store_true",
                    help="Include the model's <thinking> block in terminal/file outputs")
 
     # OpenWebUI handoff
-    p.add_argument("--openwebui", action="store_true",
+    p.add_argument("-O", "--openwebui", action="store_true",
                    help="Upload outputs to an OpenWebUI chat and open the chat in a browser")
     p.add_argument("--openwebui-base", default=os.environ.get("HOMEDOC_OPENWEBUI_BASE"),
                    help="OpenWebUI base URL (e.g. https://openwebui.example.com)")
@@ -185,7 +185,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="OpenWebUI API token for the configured user")
 
     # Redaction
-    p.add_argument("--redact", default=None,
+    p.add_argument("-R", "--redact", default=None,
                    help="Comma-separated: ips,macs,nums,hex (applies to outputs, not internal clustering)")
 
     args = p.parse_args(argv)

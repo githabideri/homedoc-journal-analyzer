@@ -10,7 +10,7 @@ If you want to commit, feel free to fork, mess around and put "ai slop" on my "a
 
 # HomeDoc — Journal Analyzer
 
-![version](https://img.shields.io/badge/version-0.1.3-blue.svg)
+![version](https://img.shields.io/badge/version-0.1.4-blue.svg)
 ![license](https://img.shields.io/badge/license-GPLv3-blue.svg)
 
 Single-file, stdlib-only utility that:
@@ -79,6 +79,8 @@ lyseur --all --tag-model --outdir ~/Obsidian/IT/homedoc/runs
   raw log capture (`raw.*`), debug stream transcript, and thinking traces.
 
 ## Key flags
+
+Short aliases mirror the long flags (e.g. `-s/--source`, `-m/--mode`, `-l/--last`, `-d/--outdir`, `-t/--tag-model`). Pair the short form with its long equivalent for quick invocations.
 
 - `--source journal|dmesg|both` (default: journal)
 - `--mode error|warn|all|security|boot|kernel` (default: error)

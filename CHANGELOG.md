@@ -1,7 +1,7 @@
 # Changelog
 
 ## Unreleased
-- _Nothing yet_
+- Add single-letter flag aliases for the CLI (e.g. `-s`, `-m`, `-l`, `-d`, `-t`) to speed up repeated runs.
 
 ## 0.1.3 — 2025-10-25
 - Prevent preflight `journalctl` counts from crashing the CLI by timing out and cleaning up long-running processes.
